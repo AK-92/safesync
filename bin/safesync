@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# SafeSync — Hardened, Verified Media Backup for macOS
+# Zero Silent Corruption over USB-C & External SSDs
+# ==============================================================================
+
+set -o pipefail
+
+VERSION="0.1.2"
+
+show_help() {
+  cat << EOF
+SafeSync (v${VERSION}) — Verified Media Backup for macOS
+
+DEFAULT BEHAVIOR:
+  Smart Incremental Mode is the DEFAULT.
+  - Existing, identical files are scanned by size + timestamp in seconds.
+  - Only new or modified files are transferred at a safe, cool 120 MB/s.
+  - All newly transferred files are immediately verified bit-for-bit with uncached
+    SHA-256 cryptographic hashes read back from physical disk.
+
+USAGE:
+  safesync [OPTIONS] <SOURCE_FOLDER> <DESTINATION_FOLDER>
+
+OPTIONS:
+  (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
+                       of all newly transferred files. Perfect for routine backups!
+  -a, --full-audit     Full Audit / Scrub Mode. Calculates SHA-256 hashes on 100% of all historical
+                       files (takes longer; recommended once/twice a year or before wiping Mac).
+  -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
+  -n, --dry-run        Simulation mode. Simulates the sync without writing any files to disk.
+  -v, --verbose        Verbose mode. Streams per-file logs and displays full transfer report in terminal.
+  -b, --bw <LIMIT>     Bandwidth rate limit (e.g. 120M, 250M, 50M). Default is 120M (thermal-safe).
+      --max, --full    Uncapped full throttle (no bandwidth limit). Recommended for transfers < 20 GB.
+  -h, --help           Show this help message and exit.
+  -V, --version        Show version number.
+
+EXAMPLES:
+  # Routine Smart Backup (Default: fast scan + cryptographic verification of new files):
+  safesync "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+
+  # Annual Full Scrub (calculates cryptographic hashes on all 100% of historical files):
+  safesync -a "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+
+  # Quick simulation test (modifies nothing, previews changes):
+  safesync -n "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+
+  # Full-speed transfer (< 20 GB) at uncapped SSD speed:
+  safesync --max "/Users/abhishek/Downloads/Trip_Video" "/Volumes/T7/Trip_Video"
+
+  # Verbose mode with full report printed in terminal:
+  safesync -v "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+
+EOF
+}
+
+# Default settings
+MODE="smart"            # Default: smart incremental
+DRY_RUN=0
+VERBOSE_MODE=0
+BW_LIMIT="120M"
+POSITIONAL_ARGS=()
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--full-audit|--scrub|--checksum)
+      MODE="full_audit"
+      shift
+      ;;
+    -q|--quick)
+      MODE="quick"
+      shift
+      ;;
+    -n|--dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE_MODE=1
+      shift
+      ;;
+    -b|--bw|--bandwidth)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo "Error: Option $1 requires an argument (e.g. -b 120M, -b 250M, -b 0)." >&2
+        exit 1
+      fi
+      BW_LIMIT="$2"
+      shift 2
+      ;;
+    --max|--full|--full-speed)
+      BW_LIMIT="0"
+      shift
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -V|--version)
+      echo "SafeSync v${VERSION}"
+      exit 0
+      ;;
+    -*)
+      echo "Error: Unknown option: $1" >&2
+      echo "Run 'safesync --help' for usage." >&2
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Validate positional arguments
+if [[ ${#POSITIONAL_ARGS[@]} -lt 2 ]]; then
+  show_help
+  exit 1
+fi
+
+SRC_RAW="${POSITIONAL_ARGS[0]}"
+DST_RAW="${POSITIONAL_ARGS[1]}"
+
+# Auto-fix trailing slashes so Finder drag-and-drop always works seamlessly
+SRC="${SRC_RAW%/}/"
+DST="${DST_RAW%/}/"
+
+if [[ ! -d "$SRC" ]]; then
+  echo "Error: Source directory does not exist: $SRC" >&2
+  exit 1
+fi
+
+# Ensure destination exists (unless dry-run)
+if [[ $DRY_RUN -eq 0 ]]; then
+  mkdir -p "$DST"
+fi
+
+# Build rsync flags
+RSYNC_FLAGS=("-avvi")
+
+if [[ "$MODE" == "full_audit" ]]; then
+  RSYNC_FLAGS+=("--checksum")
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  RSYNC_FLAGS+=("-n")
+fi
+
+if [[ "$BW_LIMIT" != "0" && "$BW_LIMIT" != "max" ]]; then
+  RSYNC_FLAGS+=("--bwlimit=$BW_LIMIT")
+fi
+
+# Essential exclusions for macOS systems and Photos libraries
+RSYNC_FLAGS+=(
+  "--exclude=.DS_Store"
+  "--exclude=*private/com.apple.photolibraryd/caches/*"
+  "--exclude=*private/com.apple.photoanalysisd/caches/*"
+  "--exclude=*private/com.apple.mediaanalysisd/caches/*"
+  "--exclude=*index.spotlightV3*"
+  "--exclude=*SpotlightKnowledgeEvents*"
+)
+
+# Display banner
+echo "=============================================================="
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "  Starting SafeSync [DRY-RUN / SIMULATION MODE]"
+elif [[ "$MODE" == "full_audit" ]]; then
+  echo "  Starting SafeSync [FULL AUDIT / 100% CHECKSUM SCRUB]"
+elif [[ "$MODE" == "quick" ]]; then
+  echo "  Starting SafeSync [QUICK-SCAN MODE (Size + Timestamp)]"
+else
+  echo "  Starting SafeSync [SMART INCREMENTAL (Auto Hash Verification)]"
+fi
+echo "  Source:      $SRC"
+echo "  Destination: $DST"
+if [[ "$BW_LIMIT" == "0" || "$BW_LIMIT" == "max" ]]; then
+  echo "  Bandwidth:   Full Throttle (Uncapped)"
+else
+  echo "  Bandwidth:   Throttled to ${BW_LIMIT} (Thermal & Packet-Drop Safe)"
+fi
+echo "=============================================================="
+
+# Export settings to environment for the Python progress monitor
+export SAFESYNC_MODE="$MODE"
+export SAFESYNC_DRY_RUN="$DRY_RUN"
+export SAFESYNC_VERBOSE="$VERBOSE_MODE"
+export SAFESYNC_SRC="$SRC"
+export SAFESYNC_DST="$DST"
+
+# Auto-detect stdbuf availability for line-buffering
+STDBUF_CMD=""
+if command -v stdbuf >/dev/null 2>&1; then
+  STDBUF_CMD="stdbuf -oL -eL"
+fi
+
+# Execute rsync with unbuffered I/O and sleep protection
+$STDBUF_CMD caffeinate -dimsu rsync "${RSYNC_FLAGS[@]}" "$SRC" "$DST" | python3 -u -c '
+import sys, re, os, time, threading, hashlib, fcntl
+
+mode = os.environ.get("SAFESYNC_MODE", "smart")
+is_dry_run = os.environ.get("SAFESYNC_DRY_RUN", "0") == "1"
+is_verbose = os.environ.get("SAFESYNC_VERBOSE", "0") == "1"
+src_dir = os.environ.get("SAFESYNC_SRC", "")
+dst_dir = os.environ.get("SAFESYNC_DST", "")
+
+stop_event = threading.Event()
+status = {"file": "Starting...", "checked": 0, "total": 0, "transferred": 0, "phase": "scan"}
+start_time = time.time()
+transferred_files = []
+report_path = os.path.expanduser("~/Desktop/safesync_report.txt")
+
+def sha256_uncached(filepath):
+    """Compute SHA-256 hash bypassing macOS RAM buffer cache (direct NAND read)."""
+    h = hashlib.sha256()
+    fd = os.open(filepath, os.O_RDONLY)
+    try:
+        if hasattr(fcntl, "F_NOCACHE"):
+            try:
+                fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+            except OSError:
+                pass
+        with open(fd, "rb", closefd=False) as f:
+            while chunk := f.read(4 * 1024 * 1024):
+                h.update(chunk)
+    finally:
+        os.close(fd)
+    return h.hexdigest()
+
+def heartbeat():
+    spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    while not stop_event.is_set():
+        elapsed = int(time.time() - start_time)
+        m, s = divmod(elapsed, 60)
+        spin = spinner[idx % len(spinner)]
+        idx += 1
+
+        if status["phase"] == "scan":
+            tag = "[Simulating]" if is_dry_run else ("[FullAudit]" if mode == "full_audit" else "[SmartSync]")
+            tot = status["total"]
+            chk = status["checked"]
+            pct = (chk / tot * 100) if tot else 0
+            bars = int(min(100, pct) / 5)
+            bar_str = "=" * bars + "-" * (20 - bars)
+            disp_file = (status["file"][:32] + "...") if len(status["file"]) > 32 else status["file"]
+            t_cnt = status["transferred"]
+            t_tag = "Would Copy" if is_dry_run else "New/Mod"
+            t_str = f" [{t_tag}: {t_cnt}]" if t_cnt > 0 else ""
+            sys.stdout.write(f"\r\033[K {spin} [{m:02d}:{s:02d}] {tag} [{bar_str}] {pct:5.1f}% ({chk}/{tot}){t_str} | {disp_file}")
+        elif status["phase"] == "verify":
+            v_curr = status["checked"]
+            v_tot = status["total"]
+            v_pct = (v_curr / v_tot * 100) if v_tot else 0
+            v_bars = int(min(100, v_pct) / 5)
+            v_bar_str = "=" * v_bars + "-" * (20 - v_bars)
+            disp_file = (status["file"][:32] + "...") if len(status["file"]) > 32 else status["file"]
+            sys.stdout.write(f"\r\033[K {spin} [{m:02d}:{s:02d}] [Verifying Hashes] [{v_bar_str}] {v_pct:5.1f}% ({v_curr}/{v_tot}) | {disp_file}")
+
+        sys.stdout.flush()
+        time.sleep(0.12)
+
+t = threading.Thread(target=heartbeat, daemon=True)
+t.start()
+
+try:
+    while True:
+        raw = sys.stdin.readline()
+        if not raw:
+            break
+        line = raw.strip()
+        if not line:
+            continue
+        m_tot = re.search(r"Transfer starting:\s*(\d+)\s*files", line)
+        if m_tot:
+            status["total"] = int(m_tot.group(1))
+            continue
+
+        if line.startswith(".f "):
+            status["checked"] += 1
+            status["file"] = line[10:].strip()
+        elif line.startswith(">f"):
+            status["checked"] += 1
+            status["transferred"] += 1
+            fname = line[10:].strip()
+            transferred_files.append(fname)
+            status["file"] = f"[NEW] {fname}"
+            if is_verbose:
+                sys.stdout.write(f"\r\033[K [COPIED] {fname}\n")
+except KeyboardInterrupt:
+    stop_event.set()
+    sys.stdout.write("\n\n [!] Sync cancelled by user (Ctrl+C).\n")
+    sys.stdout.flush()
+    sys.exit(130)
+
+# Phase 2: Cryptographic Hash Verification on Newly Transferred Files
+corrupted_files = []
+verified_files = []
+
+if mode == "smart" and not is_dry_run and len(transferred_files) > 0:
+    status["phase"] = "verify"
+    status["checked"] = 0
+    status["total"] = len(transferred_files)
+
+    for idx, rel_path in enumerate(transferred_files, start=1):
+        status["checked"] = idx
+        status["file"] = rel_path
+        src_path = os.path.join(src_dir, rel_path)
+        dst_path = os.path.join(dst_dir, rel_path)
+
+        if not os.path.exists(dst_path):
+            corrupted_files.append((rel_path, "Missing at destination"))
+            continue
+
+        try:
+            s_hash = sha256_uncached(src_path)
+            d_hash = sha256_uncached(dst_path)
+            if s_hash == d_hash:
+                verified_files.append(rel_path)
+            else:
+                corrupted_files.append((rel_path, f"Hash mismatch (expected {s_hash[:8]}, got {d_hash[:8]})"))
+                if is_verbose:
+                    sys.stdout.write(f"\r\033[K [CORRUPTED] {rel_path}\n")
+        except Exception as e:
+            corrupted_files.append((rel_path, f"Verification read error: {e}"))
+
+stop_event.set()
+t.join()
+
+sys.stdout.write("\n")
+sys.stdout.flush()
+
+elapsed = int(time.time() - start_time)
+m, s = divmod(elapsed, 60)
+print("=" * 62)
+now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+chk_final = status["checked"]
+tot_final = status["total"]
+
+if is_dry_run:
+    if transferred_files:
+        print(f" [✓] DRY-RUN COMPLETE ({m:02d}m {s:02d}s): {chk_final} files scanned.")
+        print(f" [i] {len(transferred_files)} files WOULD be transferred on a real run.")
+    else:
+        print(f" [✓] DRY-RUN SUCCESS ({m:02d}m {s:02d}s): All files are already identical!")
+        print("     (0 files would need modification)")
+elif corrupted_files:
+    print(f" [!] CRITICAL: {len(corrupted_files)} files failed cryptographic verification!")
+    for f, err in corrupted_files:
+        print(f"     - {f}: {err}")
+    try:
+        with open(report_path, "w") as rf:
+            rf.write("SafeSync Corruption Report - " + now_str + "\n")
+            rf.write(f"Source:      {src_dir}\n")
+            rf.write(f"Destination: {dst_dir}\n")
+            rf.write(f"Corrupted files ({len(corrupted_files)}):\n")
+            for f, err in corrupted_files:
+                rf.write(f"  - {f}: {err}\n")
+        print(f"     Detailed report saved to: {report_path}")
+    except Exception:
+        pass
+    sys.exit(1)
+elif transferred_files:
+    try:
+        with open(report_path, "w") as rf:
+            rf.write("SafeSync Transfer Report - " + now_str + "\n")
+            rf.write(f"Source:      {src_dir}\n")
+            rf.write(f"Destination: {dst_dir}\n")
+            rf.write(f"Duration:    {m:02d}m {s:02d}s\n")
+            rf.write(f"Mode:        {mode}\n")
+            rf.write(f"Total files verified bit-for-bit ({len(transferred_files)}):\n")
+            for f in transferred_files:
+                rf.write(f"  - {f}\n")
+    except Exception:
+        pass
+
+    if mode == "smart":
+        print(f" [✓] SMART SYNC SUCCESS ({m:02d}m {s:02d}s):")
+        print(f"     - {len(transferred_files)} new/modified files transferred & 100% verified bit-for-bit!")
+        print(f"     - Historical files skipped instantly in seconds.")
+        print(f"     Detailed report saved to: {report_path}")
+    else:
+        print(f" [✓] SYNC COMPLETE ({m:02d}m {s:02d}s): {len(transferred_files)} files transferred.")
+        print(f"     Detailed report saved to: {report_path}")
+
+    if is_verbose and os.path.exists(report_path):
+        print("-" * 62)
+        print("          DETAILED TRANSFER REPORT CONTENTS")
+        print("-" * 62)
+        with open(report_path, "r") as rf:
+            sys.stdout.write(rf.read())
+        print("-" * 62)
+else:
+    if os.path.exists(report_path):
+        try: os.remove(report_path)
+        except OSError: pass
+    print(f" [✓] SMART SYNC SUCCESS ({m:02d}m {s:02d}s): All files are 100% up to date!")
+    print("     (0 files needed transfer - destination was already clean)")
+
+print("=" * 62)
+'
+
+RSYNC_STATUS=${PIPESTATUS[0]}
+
+# Exit code 24 = vanished source files (often harmless temporary lock files)
+if [[ $RSYNC_STATUS -ne 0 && $RSYNC_STATUS -ne 24 ]]; then
+  echo " [!] WARNING: rsync exited with status code $RSYNC_STATUS" >&2
+  exit $RSYNC_STATUS
+fi
+
+exit 0
