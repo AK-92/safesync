@@ -39,13 +39,14 @@ else
   fi
 fi
 
-# Ensure ~/.zshrc has the command mapped
+# Ensure ~/.zshrc has the command mapped safely (SEC-02)
 ZSHRC="${HOME}/.zshrc"
 if [[ -f "$ZSHRC" ]]; then
   if ! grep -q "safesync()" "$ZSHRC" && ! grep -q "alias safesync=" "$ZSHRC"; then
     echo "" >> "$ZSHRC"
     echo "# SafeSync CLI" >> "$ZSHRC"
-    echo "alias safesync=\"$INSTALLED_PATH\"" >> "$ZSHRC"
+    ESCAPED_PATH="${INSTALLED_PATH//\'/\'\\\'\'}"
+    printf "alias safesync='%s'\n" "$ESCAPED_PATH" >> "$ZSHRC"
     echo "Added alias to ~/.zshrc"
   fi
 fi

@@ -19,10 +19,10 @@ safesync <SOURCE_FOLDER> <DESTINATION_FOLDER>
 ```
 
 executes **Smart Incremental Mode**:
-1. **Instant Skip for Historical Files:** Scans 50–100+ GB of older, unchanged photos/videos by size and timestamp in **~5 to 10 seconds**.
-2. **Thermal-Safe Transfer:** Copies only new or modified files (e.g. your recent 10–20 GB) at a cool, throttled 120 MB/s to protect your SSD from overheating.
+1. **Instant Skip for Historical Files:** Scans 50–100+ GB of older, unchanged media by size and timestamp in **~5 to 10 seconds**.
+2. **Thermal-Safe Transfer:** Copies only new or modified files at a cool, throttled 120 MB/s to protect the SSD controller from thermal throttling.
 3. **Automatic Cryptographic Verification:** Immediately runs uncached **SHA-256 cryptographic hash checks** on all newly transferred files, reading them back directly from physical disk to guarantee zero bit-rot or packet drops.
-4. **Fast Runtime:** Routine incremental backups finish in **~2 to 3 minutes** instead of 30+ minutes.
+4. **Fast Runtime:** Routine incremental backups finish in minutes instead of requiring a prolonged full-drive rewrite.
 
 ---
 
@@ -36,7 +36,7 @@ executes **Smart Incremental Mode**:
 
 ```bash
 # Example syntax:
-safesync "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7_Secure_Backup/Photos Library.photoslibrary"
+safesync "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
 > [!TIP]
@@ -53,13 +53,14 @@ USAGE:
 OPTIONS:
   (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
                        of all newly transferred files. Perfect for routine backups!
-  -a, --full-audit     Full Audit / Scrub Mode. Calculates SHA-256 hashes on 100% of all historical
-                       files (takes longer; recommended once/twice a year or before wiping Mac).
+  -a, --full-audit     Full Audit / Scrub Mode. Runs cryptographic checksum verification across 100%
+                       of historical files via rsync (recommended periodically or before wiping a Mac).
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
-  -n, --dry-run        Simulation mode. Simulates the sync without writing any files to disk.
+  -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
+  -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
   -v, --verbose        Verbose mode. Streams per-file logs and displays full transfer report in terminal.
   -b, --bw <LIMIT>     Bandwidth rate limit (e.g. 120M, 250M, 50M). Default is 120M (thermal-safe).
-      --max, --full    Uncapped full throttle (no bandwidth limit). Recommended for transfers < 20 GB.
+  -m, --max, --full    Uncapped full throttle (no bandwidth limit). Recommended for transfers < 20 GB.
   -h, --help           Show help message.
   -V, --version        Show version number.
 ```
@@ -68,28 +69,33 @@ OPTIONS:
 
 #### 1. Routine Smart Backup (Default — Fast & Cryptographically Verified)
 ```bash
-safesync "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+safesync "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
 #### 2. Annual Full Scrub (Audits 100% of Historical Files)
-Use this once or twice a year or before wiping/reformatting your Mac:
+Use this periodically or before wiping/reformatting a Mac:
 ```bash
-safesync -a "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+safesync -a "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
 #### 3. Dry-Run Simulation (Test without Modifying Files)
 ```bash
-safesync -n "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+safesync -d "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
-#### 4. Small Transfer (< 20 GB) at Full Throttle
+#### 4. Interactive Pre-Flight Confirmation (Prompts Before Copying)
 ```bash
-safesync --max "/Users/abhishek/Downloads/Trip_Video" "/Volumes/T7/Trip_Video"
+safesync -i "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
-#### 5. Verbose Mode with Report Displayed in Terminal
+#### 5. Small Transfer (< 20 GB) at Full Throttle
 ```bash
-safesync -v "/Users/abhishek/Pictures/Photos Library.photoslibrary" "/Volumes/T7/Photos Library.photoslibrary"
+safesync -m "/Users/<username>/Movies/Trip_Video" "/Volumes/BackupSSD/Trip_Video"
+```
+
+#### 6. Verbose Mode with Report Displayed in Terminal
+```bash
+safesync -v "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
 ---
@@ -133,7 +139,7 @@ If `rsync` ever exits with an error status code, use this reference table:
 
 ---
 
-## Best Practices for External SSDs (Samsung T7)
+## Best Practices for External SSDs (Samsung T7, SanDisk Extreme, Crucial X-Series)
 
 1. **Direct Port Connection:** Always connect directly to a Mac Thunderbolt/USB-C port using the original brand cable. Avoid unpowered USB hubs during large transfers.
 2. **Drive Filesystem:** If using the drive exclusively on macOS, format it as **APFS (GUID Partition Table)**. Avoid splitting a single drive into both exFAT and APFS partitions for backups.
