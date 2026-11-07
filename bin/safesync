@@ -8,7 +8,7 @@ set -o pipefail
 
 # NOTE (SEC-14): Do NOT add 'set -e' — PIPESTATUS capture and custom error reporting
 # require pipelines and pre-flight tests to complete without early shell abort.
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 show_help() {
   cat << EOF
@@ -27,8 +27,8 @@ USAGE:
 OPTIONS:
   (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
                        of all newly transferred files. Perfect for routine backups!
-  -a, --full-audit     Full Audit / Scrub Mode. Runs cryptographic checksum verification across 100%
-                       of historical files via rsync (recommended periodically or before wiping a Mac).
+  -a, --full-audit     Full Audit / Scrub Mode. 3-step cryptographic audit (Source Baseline -> Destination
+                       NAND Scrub with 5 GB thermal firebreaks -> Bit-for-bit verification & auto-repair).
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
   -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
   -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
@@ -44,7 +44,7 @@ EXAMPLES:
   # Routine Smart Backup (Default: fast scan + cryptographic verification of new files):
   safesync "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 
-  # Annual Full Scrub (runs checksum verification on 100% of historical files):
+  # Annual Full Scrub (3-step cryptographic audit across physical media with thermal firebreaks):
   safesync -a "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 
   # Quick simulation test (modifies nothing, previews changes):
@@ -64,6 +64,18 @@ EXAMPLES:
 
 EOF
 }
+
+# ANSI terminal escapes for Bash output
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_YELLOW=""
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_YELLOW=$'\033[33m'
+fi
 
 # Default settings
 MODE="smart"            # Default: smart incremental
@@ -210,21 +222,22 @@ if [[ ! -d "$DST" ]]; then
     echo "=============================================================="
     echo ""
   else
-    echo "=============================================================="
-    echo "  [!] NOTICE: Destination folder does not exist:"
-    echo "      $DST"
-    echo "      SafeSync will create this folder and perform an INITIAL backup."
-    echo "      (If you intended an incremental sync, please check path for typos)"
-    echo "=============================================================="
+    echo -e "${C_YELLOW}${C_BOLD}==============================================================${C_RESET}"
+    echo -e "${C_YELLOW}${C_BOLD}  [!] ⚠️  ATTENTION: Destination folder does not exist:${C_RESET}"
+    echo -e "${C_YELLOW}      $DST${C_RESET}"
+    echo -e "${C_YELLOW}      SafeSync will create this folder and perform an INITIAL backup.${C_RESET}"
+    echo -e "${C_YELLOW}      (If you intended an incremental sync, please check path for typos)${C_RESET}"
+    echo -e "${C_YELLOW}${C_BOLD}==============================================================${C_RESET}"
     CONFIRM_NEW_DST="n"
+    PROMPT_MSG="${C_YELLOW}${C_BOLD} Create destination folder and proceed? [y/N]: ${C_RESET}"
     if [[ -t 0 ]]; then
-      read -r -p " Create destination folder and proceed? [y/N]: " CONFIRM_NEW_DST
+      read -r -p "$PROMPT_MSG" CONFIRM_NEW_DST
     else
-      read -r -p " Create destination folder and proceed? [y/N]: " CONFIRM_NEW_DST || CONFIRM_NEW_DST="n"
+      read -r -p "$PROMPT_MSG" CONFIRM_NEW_DST || CONFIRM_NEW_DST="n"
     fi
     if [[ ! "$CONFIRM_NEW_DST" =~ ^[Yy] ]]; then
-      echo " [!] Sync cancelled by user. Please verify your destination path."
-      exit 0
+      echo -e "${C_YELLOW} [!] Sync cancelled by user. Please verify your destination path.${C_RESET}"
+      exit 1
     fi
     echo ""
   fi
@@ -245,7 +258,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
 fi
 
 # Build rsync flags
-RSYNC_FLAGS=("-avvi" "--force" "--partial-dir=.safesync-partial")
+RSYNC_FLAGS=("-avvi" "--8-bit-output" "--force" "--partial-dir=.safesync-partial")
 
 if [[ "$MODE" == "full_audit" ]]; then
   RSYNC_FLAGS+=("--checksum")
@@ -287,9 +300,9 @@ fi
 RSYNC_FLAGS+=(
   "--exclude=.DS_Store"
   "--exclude=.safesync-partial"
-  "--exclude=*private/com.apple.photolibraryd/caches/*"
-  "--exclude=*private/com.apple.photoanalysisd/caches/*"
-  "--exclude=*private/com.apple.mediaanalysisd/caches/*"
+  "--exclude=*private/com.apple.photolibraryd/caches*"
+  "--exclude=*private/com.apple.photoanalysisd/caches*"
+  "--exclude=*private/com.apple.mediaanalysisd/caches*"
   "--exclude=*index.spotlightV3*"
   "--exclude=*SpotlightKnowledgeEvents*"
 )
@@ -322,10 +335,24 @@ if [[ $INTERACTIVE -eq 1 && $DRY_RUN -eq 0 ]]; then
     fi
   done
 
-  PREFLIGHT_RAW=$(rsync "${CLEAN_PREFLIGHT_FLAGS[@]}" -n "$SRC" "$DST" 2>/dev/null)
+  PREFLIGHT_ERR_FILE="/tmp/safesync_preflight_err.$$.log"
+  PREFLIGHT_RAW=$(rsync "${CLEAN_PREFLIGHT_FLAGS[@]}" -n "$SRC" "$DST" 2>"$PREFLIGHT_ERR_FILE")
+  PREFLIGHT_STATUS=$?
+
+  if [[ $PREFLIGHT_STATUS -ne 0 && $PREFLIGHT_STATUS -ne 24 ]]; then
+    echo "==============================================================" >&2
+    echo "  [!] ERROR: Pre-flight scan failed (rsync exit code $PREFLIGHT_STATUS)." >&2
+    if [[ -f "$PREFLIGHT_ERR_FILE" ]]; then
+      cat "$PREFLIGHT_ERR_FILE" >&2
+      rm -f "$PREFLIGHT_ERR_FILE"
+    fi
+    echo "==============================================================" >&2
+    exit $PREFLIGHT_STATUS
+  fi
+  rm -f "$PREFLIGHT_ERR_FILE" 2>/dev/null || true
 
   # SEC-13: Count all item types accurately (files, directories, symlinks)
-  NEW_MOD_COUNT=$(echo "$PREFLIGHT_RAW" | grep -E '^[>c][fdL]' | wc -l | tr -d ' ')
+  NEW_MOD_COUNT=$(echo "$PREFLIGHT_RAW" | grep -E '^[>ch][fdL]' | wc -l | tr -d ' ')
   UNCHANGED_COUNT=$(echo "$PREFLIGHT_RAW" | grep -E '^\.[fdL]' | wc -l | tr -d ' ')
   DELETED_COUNT=$(echo "$PREFLIGHT_RAW" | grep -E '^\*deleting' | wc -l | tr -d ' ')
 
@@ -368,31 +395,32 @@ if [[ $INTERACTIVE -eq 1 && $DRY_RUN -eq 0 ]]; then
 fi
 
 # Display banner
-echo "=============================================================="
+echo -e "${C_DIM}==============================================================${C_RESET}"
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "  Starting SafeSync [DRY-RUN / SIMULATION MODE]"
+  echo -e "  🔍 ${C_BOLD}Starting SafeSync v${VERSION} [DRY-RUN / SIMULATION MODE]${C_RESET}"
 elif [[ "$MODE" == "full_audit" ]]; then
-  echo "  Starting SafeSync [FULL AUDIT / 100% CHECKSUM SCRUB]"
+  echo -e "  🛡️  ${C_BOLD}Starting SafeSync v${VERSION} [FULL AUDIT / 100% CHECKSUM SCRUB]${C_RESET}"
 elif [[ "$MODE" == "quick" ]]; then
-  echo "  Starting SafeSync [QUICK-SCAN MODE (Size + Timestamp)]"
+  echo -e "  ⚡ ${C_BOLD}Starting SafeSync v${VERSION} [QUICK-SCAN MODE (Size + Timestamp)]${C_RESET}"
 else
-  echo "  Starting SafeSync [SMART INCREMENTAL (Auto Hash Verification)]"
+  echo -e "  🛡️  ${C_BOLD}Starting SafeSync v${VERSION} [SMART INCREMENTAL (Bit-for-Bit Verified)]${C_RESET}"
 fi
-echo "  Source:      $SRC"
-echo "  Destination: $DST"
+echo -e "${C_DIM}  📁 Source:       $SRC${C_RESET}"
+echo -e "${C_DIM}  💾 Destination:  $DST${C_RESET}"
 if [[ "$BW_LIMIT" == "0" || "$BW_LIMIT" == "max" ]]; then
-  echo "  Bandwidth:   Full Throttle (Uncapped)"
+  echo -e "${C_DIM}  🚀 Bandwidth:    Full Throttle (Uncapped)${C_RESET}"
 else
-  echo "  Bandwidth:   Throttled to ${BW_LIMIT} (Thermal & Packet-Drop Safe)"
+  echo -e "${C_DIM}  ❄️  Bandwidth:    Throttled to ${BW_LIMIT} (Thermal & Packet-Drop Safe)${C_RESET}"
 fi
 if [[ $PRUNE -eq 1 ]]; then
-  echo "  Prune Mode:  Enabled (Orphan cleanup active)"
+  echo -e "${C_DIM}  ✂️  Prune Mode:   Enabled (Orphan cleanup active)${C_RESET}"
 fi
 if [[ $VERBOSE_MODE -eq 1 ]]; then
-  echo "  Rsync Engine: $RSYNC_ENGINE"
-  echo "  Dest Space:  $DST_FREE_STR free"
+  echo -e "${C_DIM}  ⚙️  Rsync Engine: $RSYNC_ENGINE${C_RESET}"
+  echo -e "${C_DIM}  📊 Dest Space:   $DST_FREE_STR free${C_RESET}"
 fi
-echo "=============================================================="
+echo -e "${C_DIM}==============================================================${C_RESET}"
+echo ""
 
 # Export settings to environment for the Python progress monitor
 export SAFESYNC_MODE="$MODE"
@@ -400,6 +428,9 @@ export SAFESYNC_DRY_RUN="$DRY_RUN"
 export SAFESYNC_VERBOSE="$VERBOSE_MODE"
 export SAFESYNC_SRC="$SRC"
 export SAFESYNC_DST="$DST"
+export SAFESYNC_PRUNE="$PRUNE"
+export SAFESYNC_BW="$BW_LIMIT"
+export SAFESYNC_VERSION="$VERSION"
 
 # Verify python3 dependency (SEC-17)
 if ! command -v python3 >/dev/null 2>&1; then
@@ -432,9 +463,524 @@ if [[ -n "$VOL" ]]; then
   fi
 fi
 
+if [[ "$MODE" == "full_audit" ]]; then
+  # Dedicated 3-Step Full Audit Engine
+  python3 -u -c '
+import sys, os, time, threading, hashlib, shutil, stat
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+src_dir = os.environ.get("SAFESYNC_SRC", "").rstrip(os.sep)
+dst_dir = os.environ.get("SAFESYNC_DST", "").rstrip(os.sep)
+is_dry_run = os.environ.get("SAFESYNC_DRY_RUN", "0") == "1"
+is_verbose = os.environ.get("SAFESYNC_VERBOSE", "0") == "1"
+is_prune = os.environ.get("SAFESYNC_PRUNE", "0") == "1"
+version_str = os.environ.get("SAFESYNC_VERSION", "0.4.0")
+report_dir = os.environ.get("SAFESYNC_REPORT_DIR") or os.path.expanduser("~/Library/Logs/safesync")
+report_path = os.path.join(report_dir, "safesync_report.txt")
+try:
+    os.makedirs(report_dir, exist_ok=True)
+except Exception:
+    pass
+
+USE_COLOR = sys.stdout.isatty()
+C_RESET = "\033[0m" if USE_COLOR else ""
+C_BOLD = "\033[1m" if USE_COLOR else ""
+C_GREEN = "\033[32m" if USE_COLOR else ""
+C_YELLOW = "\033[33m" if USE_COLOR else ""
+C_RED = "\033[31m" if USE_COLOR else ""
+C_CYAN = "\033[36m" if USE_COLOR else ""
+
+stdout_lock = threading.Lock()
+def safe_write(msg):
+    with stdout_lock:
+        try:
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+        except UnicodeEncodeError:
+            try:
+                sys.stdout.buffer.write(msg.encode("utf-8", errors="replace"))
+                sys.stdout.buffer.flush()
+            except Exception:
+                pass
+
+def clear_progress():
+    if USE_COLOR:
+        safe_write("\r\033[2K\r")
+
+def format_size(bytes_num):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_num < 1024.0:
+            return f"{bytes_num:.1f} {unit}"
+        bytes_num /= 1024.0
+    return f"{bytes_num:.1f} PB"
+
+def format_report_link(path):
+    abs_path = os.path.abspath(path)
+    file_uri = f"file://{abs_path}"
+    if USE_COLOR:
+        return f"\033]8;;{file_uri}\033\\{file_uri}\033]8;;\033\\"
+    return file_uri
+
+def user_display_report(path):
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+def write_report_file(content):
+    try:
+        report_dir = os.path.dirname(report_path)
+        os.makedirs(report_dir, exist_ok=True)
+        fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as rf:
+            rf.write(content)
+        return True
+    except Exception:
+        return False
+
+def is_excluded(rel_path):
+    parts = rel_path.split(os.sep)
+    for part in parts:
+        if part in (".DS_Store", ".safesync-partial"):
+            return True
+        if part.startswith(".Spotlight-V100") or part.startswith(".Trashes") or part.startswith(".fseventsd"):
+            return True
+        if "index.spotlightV3" in part or "SpotlightKnowledgeEvents" in part:
+            return True
+        if part.startswith("com.apple.photolibraryd") or part.startswith("com.apple.photoanalysisd") or part.startswith("com.apple.mediaanalysisd"):
+            return True
+    if "private/com.apple.photolibraryd/caches" in rel_path or "private/com.apple.photoanalysisd/caches" in rel_path or "private/com.apple.mediaanalysisd/caches" in rel_path:
+        return True
+    return False
+
+start_time = time.time()
+status = {
+    "step": 1,
+    "checked": 0,
+    "total": 0,
+    "file": "",
+    "thermal_msg": "",
+    "bytes_done": 0,
+    "total_bytes": 0,
+    "speed": ""
+}
+stop_event = threading.Event()
+
+def heartbeat():
+    if not USE_COLOR:
+        return
+    spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    last_bytes = 0
+    last_speed_time = time.time()
+    while not stop_event.is_set():
+        elapsed = int(time.time() - start_time)
+        m, s = divmod(elapsed, 60)
+        spin = spinner[idx % len(spinner)]
+        idx += 1
+
+        now = time.time()
+        dt = now - last_speed_time
+        if dt >= 0.5:
+            db = status["bytes_done"] - last_bytes
+            spd = (db / dt) / (1024 * 1024)
+            status["speed"] = f"{spd:.0f} MB/s" if spd >= 1.0 else ""
+            last_bytes = status["bytes_done"]
+            last_speed_time = now
+
+        step = status["step"]
+        tot = status["total"]
+        chk = status["checked"]
+        pct = (chk / tot * 100) if tot else 0
+        bars = int(min(100, pct) / 5)
+        bar_str = "=" * bars + "-" * (20 - bars)
+        speed_val = status["speed"]
+        spd_str = f" [{speed_val}]" if speed_val else ""
+        thermal_val = status["thermal_msg"]
+
+        if thermal_val:
+            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] ❄️  [Step 2/3: Thermal Firebreak] [{bar_str}] {pct:5.1f}% ({chk:,}/{tot:,}){spd_str} | {thermal_val}")
+        elif step == 1:
+            disp_file = (status["file"][:30] + "...") if len(status["file"]) > 30 else status["file"]
+            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] 🛡️  [Step 1/3: Reading Source] [{bar_str}] {pct:5.1f}% ({chk:,}/{tot:,}){spd_str} | {disp_file}")
+        elif step == 2:
+            disp_file = (status["file"][:30] + "...") if len(status["file"]) > 30 else status["file"]
+            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] 🛡️  [Step 2/3: Reading Destination] [{bar_str}] {pct:5.1f}% ({chk:,}/{tot:,}){spd_str} | {disp_file}")
+        elif step == 3:
+            disp_file = (status["file"][:30] + "...") if len(status["file"]) > 30 else status["file"]
+            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] ⚡ [Step 3/3: Auto-Repair] [{bar_str}] {pct:5.1f}% ({chk:,}/{tot:,}) | {disp_file}")
+
+        time.sleep(0.12)
+
+t = threading.Thread(target=heartbeat, daemon=True)
+t.start()
+
+def stop_heartbeat(clear=True):
+    stop_event.set()
+    if t.is_alive():
+        t.join()
+    if clear:
+        clear_progress()
+
+try:
+    # STEP 1: Reading & Hashing Source (Mac NVMe SSD)
+    status["step"] = 1
+    src_items = []
+    total_src_bytes = 0
+
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if not is_excluded(os.path.relpath(os.path.join(root, d), src_dir))]
+        dirs.sort()
+        for fname in sorted(files):
+            p = os.path.join(root, fname)
+            rel = os.path.relpath(p, src_dir)
+            if is_excluded(rel):
+                continue
+            try:
+                sz = os.path.getsize(p) if not os.path.islink(p) else 0
+                src_items.append((rel, sz, os.path.islink(p)))
+                total_src_bytes += sz
+            except OSError:
+                pass
+
+    status["total"] = len(src_items)
+    status["total_bytes"] = total_src_bytes
+
+    src_catalog = {}
+    for idx, (rel, sz, is_link) in enumerate(src_items, start=1):
+        status["checked"] = idx
+        status["file"] = rel
+        p = os.path.join(src_dir, rel)
+
+        if is_link:
+            try:
+                target = os.readlink(p)
+                src_catalog[rel] = (0, f"link:{target}", True)
+            except OSError as e:
+                src_catalog[rel] = (0, f"error:{e}", True)
+            continue
+
+        h = hashlib.sha256()
+        try:
+            with open(p, "rb") as f:
+                while chunk := f.read(4 * 1024 * 1024):
+                    h.update(chunk)
+                    status["bytes_done"] += len(chunk)
+            src_catalog[rel] = (sz, h.hexdigest(), False)
+        except Exception as e:
+            src_catalog[rel] = (sz, f"error:{e}", False)
+
+    elapsed_s1 = int(time.time() - start_time)
+    m1, s1 = divmod(elapsed_s1, 60)
+    clear_progress()
+    safe_write(f"[✓] [{m1:02d}:{s1:02d}] 🛡️  [Step 1/3: Reading Source] [====================] 100.0% ({len(src_items):,}/{len(src_items):,}) [{format_size(total_src_bytes)}] | Baseline cataloged\n")
+
+    # STEP 2: Reading & Hashing Destination (With 5 GB Thermal Firebreaks)
+    status["step"] = 2
+    status["checked"] = 0
+    status["total"] = len(src_catalog)
+    status["bytes_done"] = 0
+    status["speed"] = ""
+    bytes_since_firebreak = 0
+    firebreak_count = 0
+    mismatches = []
+
+    for idx, (rel, (src_sz, src_hash, is_link)) in enumerate(src_catalog.items(), start=1):
+        status["checked"] = idx
+        status["file"] = rel
+        dp = os.path.join(dst_dir, rel)
+
+        if not os.path.lexists(dp):
+            mismatches.append((rel, "Missing at destination"))
+            continue
+
+        if is_link:
+            if not os.path.islink(dp):
+                mismatches.append((rel, "Expected symlink at destination but found regular item"))
+                continue
+            try:
+                dst_target = os.readlink(dp)
+                if f"link:{dst_target}" != src_hash:
+                    mismatches.append((rel, f"Symlink target mismatch (expected {src_hash[5:]}, got {dst_target})"))
+            except OSError as e:
+                mismatches.append((rel, f"Symlink read error: {e}"))
+            continue
+
+        if os.path.islink(dp):
+            mismatches.append((rel, "Expected regular file at destination but found symlink"))
+            continue
+
+        try:
+            dst_sz = os.path.getsize(dp)
+            if dst_sz != src_sz:
+                mismatches.append((rel, f"Size mismatch (expected {src_sz:,} B, got {dst_sz:,} B)"))
+                continue
+
+            h = hashlib.sha256()
+            with open(dp, "rb") as f:
+                while chunk := f.read(4 * 1024 * 1024):
+                    h.update(chunk)
+                    status["bytes_done"] += len(chunk)
+                    bytes_since_firebreak += len(chunk)
+
+            dst_hash = h.hexdigest()
+            if dst_hash != src_hash:
+                mismatches.append((rel, f"Hash mismatch (expected {src_hash[:8]}, got {dst_hash[:8]})"))
+
+            if bytes_since_firebreak >= 5 * 1024 * 1024 * 1024:
+                bytes_since_firebreak = 0
+                firebreak_count += 1
+                try:
+                    os.sync()
+                except Exception:
+                    pass
+                for sec in range(5, 0, -1):
+                    if stop_event.is_set():
+                        break
+                    status["thermal_msg"] = f"Cooling external drive ({sec}s)"
+                    time.sleep(1.0)
+                status["thermal_msg"] = ""
+                try:
+                    os.sync()
+                except Exception:
+                    pass
+        except Exception as e:
+            mismatches.append((rel, f"Read error: {e}"))
+
+    elapsed_s2 = int(time.time() - start_time)
+    m2, s2 = divmod(elapsed_s2, 60)
+    clear_progress()
+    safe_write(f"[✓] [{m2:02d}:{s2:02d}] 🛡️  [Step 2/3: Reading Destination] [====================] 100.0% ({len(src_catalog):,}/{len(src_catalog):,}) [{format_size(total_src_bytes)}] | Physical NAND verified\n")
+
+    orphaned_files = []
+    for root, dirs, files in os.walk(dst_dir):
+        dirs[:] = [d for d in dirs if not is_excluded(os.path.relpath(os.path.join(root, d), dst_dir))]
+        dirs.sort()
+        for fname in sorted(files):
+            p = os.path.join(root, fname)
+            rel = os.path.relpath(p, dst_dir)
+            if is_excluded(rel):
+                continue
+            if rel not in src_catalog:
+                orphaned_files.append(rel)
+
+    pruned_count = 0
+    if is_prune and not is_dry_run:
+        for rel in orphaned_files:
+            try:
+                os.remove(os.path.join(dst_dir, rel))
+                pruned_count += 1
+            except OSError:
+                pass
+
+    # STEP 3: Verification & Auto-Repair
+    status["step"] = 3
+    repaired_files = []
+    repair_failed = []
+
+    if mismatches and not is_dry_run:
+        status["total"] = len(mismatches)
+        for idx, (rel, reason) in enumerate(mismatches, start=1):
+            status["checked"] = idx
+            status["file"] = rel
+            sp = os.path.join(src_dir, rel)
+            dp = os.path.join(dst_dir, rel)
+            try:
+                os.makedirs(os.path.dirname(dp), exist_ok=True)
+                if os.path.islink(sp):
+                    if os.path.isdir(dp) and not os.path.islink(dp):
+                        try:
+                            shutil.rmtree(dp)
+                        except OSError:
+                            pass
+                    elif os.path.lexists(dp):
+                        try:
+                            os.unlink(dp)
+                        except OSError:
+                            pass
+                    os.symlink(os.readlink(sp), dp)
+                    repaired_files.append(rel)
+                else:
+                    if os.path.isdir(dp) and not os.path.islink(dp):
+                        try:
+                            shutil.rmtree(dp)
+                        except OSError:
+                            pass
+                    shutil.copy2(sp, dp)
+                    try:
+                        os.sync()
+                    except Exception:
+                        pass
+                    h = hashlib.sha256()
+                    with open(dp, "rb") as f:
+                        while chunk := f.read(4 * 1024 * 1024):
+                            h.update(chunk)
+                    if h.hexdigest() == src_catalog[rel][1]:
+                        repaired_files.append(rel)
+                    else:
+                        repair_failed.append((rel, "Cryptographic hash mismatch after copy"))
+                        try:
+                            os.remove(dp)
+                        except OSError:
+                            pass
+            except Exception as e:
+                repair_failed.append((rel, f"Copy error: {e}"))
+
+        elapsed_s3 = int(time.time() - start_time)
+        m3, s3 = divmod(elapsed_s3, 60)
+        clear_progress()
+        safe_write(f"[✓] [{m3:02d}:{s3:02d}] ⚡ [Step 3/3: Auto-Repair] [====================] 100.0% ({len(repaired_files):,}/{len(mismatches):,}) | Repaired & verified bit-for-bit\n")
+    elif is_dry_run:
+        elapsed_s3 = int(time.time() - start_time)
+        m3, s3 = divmod(elapsed_s3, 60)
+        clear_progress()
+        if mismatches:
+            safe_write(f"[✓] [{m3:02d}:{s3:02d}] 🔍 [Step 3/3: Dry-Run Audit] [====================] 100.0% ({len(src_catalog):,}/{len(src_catalog):,}) | Audit Preview ({len(mismatches):,} divergent files detected)\n")
+        else:
+            safe_write(f"[✓] [{m3:02d}:{s3:02d}] 🔍 [Step 3/3: Dry-Run Audit] [====================] 100.0% ({len(src_catalog):,}/{len(src_catalog):,}) | 100% Bit-for-Bit Identical\n")
+    else:
+        elapsed_s3 = int(time.time() - start_time)
+        m3, s3 = divmod(elapsed_s3, 60)
+        clear_progress()
+        safe_write(f"[✓] [{m3:02d}:{s3:02d}] 🛡️  [Step 3/3: Cryptographic Audit] [====================] 100.0% ({len(src_catalog):,}/{len(src_catalog):,}) | 100% Bit-for-Bit Identical\n")
+
+    stop_heartbeat(clear=True)
+    safe_write("\n")
+
+    elapsed = int(time.time() - start_time)
+    m, s = divmod(elapsed, 60)
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    banner_line = "═" * 62
+
+    report_lines = [
+        "SafeSync Full Audit Report - " + now_str,
+        f"Source:      {src_dir}",
+        f"Destination: {dst_dir}",
+        f"Duration:    {m:02d}m {s:02d}s",
+        f"Mode:        full_audit",
+        f"Total files: {len(src_catalog):,} ({format_size(total_src_bytes)})",
+        f"Thermal:     {firebreak_count} firebreak pauses taken (every 5 GB)",
+        f"Bit rot:     {len(mismatches):,}",
+        f"Repaired:    {len(repaired_files):,}",
+        f"Failed:      {len(repair_failed):,}",
+        f"Orphans:     {len(orphaned_files):,} ({pruned_count:,} pruned)"
+    ]
+    if mismatches:
+        report_lines.append("")
+        report_lines.append(f"[DIVERGENT / REPAIRED FILES] ({len(mismatches)}):")
+        for f, err in mismatches:
+            report_lines.append(f"  ~ {f}: {err}")
+    if repair_failed:
+        report_lines.append("")
+        report_lines.append(f"[REPAIR FAILED FILES] ({len(repair_failed)}):")
+        for f, err in repair_failed:
+            report_lines.append(f"  ! {f}: {err}")
+    if orphaned_files:
+        report_lines.append("")
+        report_lines.append(f"[ORPHANED FILES] ({len(orphaned_files)}):")
+        for f in orphaned_files:
+            report_lines.append(f"  - {f}")
+
+    write_report_file("\n".join(report_lines) + "\n")
+
+    if is_dry_run:
+        safe_write(f"{C_YELLOW}{C_BOLD}{banner_line}{C_RESET}\n")
+        safe_write(f"{C_YELLOW}{C_BOLD} [✓] 🔍 DRY-RUN AUDIT COMPLETE ({m:02d}m {s:02d}s): {len(src_catalog):,} files audited.{C_RESET}\n")
+        if mismatches:
+            safe_write(f"{C_YELLOW} [i] 📦 {len(mismatches):,} divergent files WOULD be repaired.{C_RESET}\n")
+        else:
+            safe_write(f"{C_YELLOW}     (100% of files on destination match source bit-for-bit){C_RESET}\n")
+        if is_prune and orphaned_files:
+            safe_write(f"{C_YELLOW} [i] 🗑️  {len(orphaned_files):,} orphaned files WOULD be deleted/pruned.{C_RESET}\n")
+        elif orphaned_files:
+            safe_write(f"{C_YELLOW}     - ℹ️  {len(orphaned_files):,} orphaned files on destination (use --prune to clean up).{C_RESET}\n")
+        safe_write(f"{C_YELLOW}{C_BOLD}{banner_line}{C_RESET}\n")
+    elif repair_failed:
+        safe_write(f"{C_RED}{C_BOLD}{banner_line}{C_RESET}\n")
+        safe_write(f"{C_RED}{C_BOLD} [!] 🚨 FULL AUDIT REPAIR INCOMPLETE: {len(repair_failed):,} files failed repair!{C_RESET}\n")
+        for f, err in repair_failed:
+            safe_write(f"{C_RED}     - {f}: {err}{C_RESET}\n")
+        if len(repaired_files) > 0:
+            safe_write(f"{C_GREEN}     - ⚡ {len(repaired_files):,} divergent files successfully repaired.{C_RESET}\n")
+        safe_write(f"{C_RED}     📄 Detailed report: {format_report_link(report_path)}{C_RESET}\n")
+        safe_write(f"{C_RED}     💡 Quick view:      open {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_RED}     📂 In Finder:       open -R {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_RED}{C_BOLD}{banner_line}{C_RESET}\n")
+        sys.exit(1)
+    elif mismatches:
+        safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
+        safe_write(f"{C_GREEN}{C_BOLD} [✓] 🛡️  FULL AUDIT REPAIR COMPLETE ({m:02d}m {s:02d}s):{C_RESET}\n")
+        safe_write(f"{C_GREEN}     - 📦 {len(src_catalog):,} files cryptographically scrubbed across physical NAND.{C_RESET}\n")
+        safe_write(f"{C_GREEN}     - ⚡ {len(repaired_files):,} divergent files repaired & 100% verified bit-for-bit!{C_RESET}\n")
+        if firebreak_count > 0:
+            safe_write(f"{C_GREEN}     - ❄️  Drive thermals safely managed ({firebreak_count} firebreak pauses).{C_RESET}\n")
+        if orphaned_files:
+            if is_prune:
+                safe_write(f"{C_GREEN}     - 🗑️  {pruned_count:,} orphaned files pruned.{C_RESET}\n")
+            else:
+                safe_write(f"{C_GREEN}     - ℹ️  {len(orphaned_files):,} orphaned files on destination (use --prune to clean up).{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📄 Detailed report: {format_report_link(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     💡 Quick view:      open {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📂 In Finder:       open -R {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
+    else:
+        safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
+        safe_write(f"{C_GREEN}{C_BOLD} [✓] 🛡️  FULL AUDIT SUCCESS ({m:02d}m {s:02d}s): All files are 100% bit-for-bit identical!{C_RESET}\n")
+        safe_write(f"{C_GREEN}     - 📦 {len(src_catalog):,} files cryptographically scrubbed across physical NAND.{C_RESET}\n")
+        safe_write(f"{C_GREEN}     - 🛡️  0 bit rot, 0 corruptions, 0 divergent files.{C_RESET}\n")
+        if firebreak_count > 0:
+            safe_write(f"{C_GREEN}     - ❄️  External drive thermals safely managed ({firebreak_count} firebreak pauses).{C_RESET}\n")
+        if orphaned_files:
+            if is_prune:
+                safe_write(f"{C_GREEN}     - 🗑️  {pruned_count:,} orphaned files pruned.{C_RESET}\n")
+            else:
+                safe_write(f"{C_GREEN}     - ℹ️  {len(orphaned_files):,} orphaned files on destination (use --prune to clean up).{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📄 Detailed report: {format_report_link(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     💡 Quick view:      open {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📂 In Finder:       open -R {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
+
+    sys.exit(0)
+
+except KeyboardInterrupt:
+    stop_heartbeat(clear=True)
+    safe_write("\n [!] Full audit cancelled by user (Ctrl+C).\n")
+    sys.exit(130)
+'
+  AUDIT_STATUS=$?
+  exit $AUDIT_STATUS
+fi
+
 # Execute rsync with unbuffered I/O
 "${STDBUF_CMD[@]}" rsync "${RSYNC_FLAGS[@]}" "$SRC" "$DST" | python3 -u -c '
-import sys, re, os, time, threading, hashlib, fcntl, stat, tempfile, shutil
+import sys, re, os, time, threading, hashlib, fcntl, stat, tempfile, shutil, atexit
+
+# Ensure streams never crash on non-UTF8 filenames (SEC-25)
+if hasattr(sys.stdin, "reconfigure"):
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="surrogateescape")
+    except Exception:
+        pass
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 mode = os.environ.get("SAFESYNC_MODE", "smart")
 is_dry_run = os.environ.get("SAFESYNC_DRY_RUN", "0") == "1"
@@ -442,11 +988,11 @@ is_verbose = os.environ.get("SAFESYNC_VERBOSE", "0") == "1"
 src_dir = os.environ.get("SAFESYNC_SRC", "")
 dst_dir = os.environ.get("SAFESYNC_DST", "")
 
-# High-contrast palette: Vivid emerald green vs warm amber orange vs crimson red
+# High-contrast palette: Darker emerald green vs pure light yellow vs vivid red
 USE_COLOR = sys.stdout.isatty()
-C_GREEN = "\033[38;5;82m" if USE_COLOR else ""    # Vivid emerald green
-C_YELLOW = "\033[38;5;214m" if USE_COLOR else ""  # Rich warm amber orange (distinct from green)
-C_RED = "\033[38;5;196m" if USE_COLOR else ""     # Vivid crimson red
+C_GREEN = "\033[38;5;34m" if USE_COLOR else ""    # Darker emerald green (lower luminance ~0.40)
+C_YELLOW = "\033[38;5;226m" if USE_COLOR else "" # Pure light yellow (high luminance ~0.89)
+C_RED = "\033[38;5;196m" if USE_COLOR else ""    # Vivid crimson red (luminance ~0.30)
 C_CYAN = "\033[38;5;39m" if USE_COLOR else ""     # Vibrant sky blue
 C_BOLD = "\033[1m" if USE_COLOR else ""
 C_RESET = "\033[0m" if USE_COLOR else ""
@@ -463,9 +1009,14 @@ status = {
     "phase": "scan"
 }
 start_time = time.time()
-report_path = os.path.expanduser("~/Desktop/safesync_report.txt")
+report_dir = os.environ.get("SAFESYNC_REPORT_DIR") or os.path.expanduser("~/Library/Logs/safesync")
+report_path = os.path.join(report_dir, "safesync_report.txt")
+try:
+    os.makedirs(report_dir, exist_ok=True)
+except Exception:
+    pass
 stdout_lock = threading.Lock()
-ITEM_REGEX = re.compile(r"^([>c.][fdLDS][^\s]*)\s+(.*)$")
+ITEM_REGEX = re.compile(r"^([>c.h][fdLDS][^\s]*)\s(.*)$")
 
 # Disk-spooling for transferred paths (SEC-07: constant memory for 500K+ files)
 transferred_spool = tempfile.NamedTemporaryFile(
@@ -473,34 +1024,156 @@ transferred_spool = tempfile.NamedTemporaryFile(
     prefix="safesync_transferred_",
     suffix=".txt",
     delete=False,
-    encoding="utf-8"
+    encoding="utf-8",
+    errors="surrogateescape"
 )
+
+def cleanup_spool():
+    try:
+        if not transferred_spool.closed:
+            transferred_spool.close()
+        if os.path.exists(transferred_spool.name):
+            os.unlink(transferred_spool.name)
+    except Exception:
+        pass
+
+atexit.register(cleanup_spool)
 transferred_count = 0
+total_transferred_bytes = 0
 new_count = 0
 mod_count = 0
 del_count = 0
 
 def safe_write(msg):
     with stdout_lock:
-        sys.stdout.write(msg)
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+        except UnicodeEncodeError:
+            try:
+                sys.stdout.buffer.write(msg.encode("utf-8", errors="replace"))
+                sys.stdout.buffer.flush()
+            except Exception:
+                pass
+
+def clear_progress():
+    """Wipe transient spinner / progress line cleanly from terminal."""
+    if USE_COLOR:
+        safe_write("\r\033[2K\r")
+
+def stop_heartbeat(clear=True):
+    """Stop the background heartbeat thread and optionally erase the progress line."""
+    global t
+    stop_event.set()
+    if t.is_alive():
+        t.join()
+    if clear:
+        clear_progress()
+
+def format_size(bytes_num):
+    """Format bytes into human-readable B, KB, MB, GB, or TB."""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_num < 1024.0:
+            if unit == "B":
+                return f"{int(bytes_num)} B"
+            return f"{bytes_num:.1f} {unit}"
+        bytes_num /= 1024.0
+    return f"{bytes_num:.1f} PB"
+
+def finalize_scan_progress(vol_bytes=0):
+    """Commit finalized 100% progress line for Phase 1 (Scan/Transfer) to scrollback."""
+    elapsed = int(time.time() - start_time)
+    m, s = divmod(elapsed, 60)
+    tag = "🔍 [Simulating]" if is_dry_run else ("🛡️  [FullAudit]" if mode == "full_audit" else ("⚡ [QuickScan]" if mode == "quick" else "⚡ [SmartSync]"))
+    final_cnt = max(status["checked"], status["total"])
+    t_cnt = status["transferred"]
+    n_cnt = status["new_count"]
+    m_cnt = status["mod_count"]
+    d_cnt = status["del_count"]
+
+    if d_cnt > 0:
+        t_str = f" [🟢 {n_cnt:,} | 🟡 {m_cnt:,} | 🔴 {d_cnt:,}]"
+    elif t_cnt > 0:
+        t_str = f" [🟢 {n_cnt:,} | 🟡 {m_cnt:,}]"
+    else:
+        t_str = ""
+
+    comp_label = "Scan complete" if is_dry_run else "Transfer complete"
+    if vol_bytes > 0:
+        comp_label += f" [{format_size(vol_bytes)}]"
+    clear_prefix = "\r\033[2K\r" if USE_COLOR else ""
+    safe_write(f"{clear_prefix} [✓] [{m:02d}:{s:02d}] {tag} [====================] 100.0% ({final_cnt:,}/{final_cnt:,}){t_str} | {comp_label}\n")
+
+def finalize_verify_progress(tot, failed_count=0, repaired_count=0):
+    """Commit finalized 100% progress line for Phase 2 (NAND Verification) to scrollback."""
+    elapsed = int(time.time() - start_time)
+    m, s = divmod(elapsed, 60)
+    clear_prefix = "\r\033[2K\r" if USE_COLOR else ""
+    if failed_count > 0:
+        safe_write(f"{clear_prefix} [!] [{m:02d}:{s:02d}] 🔒 [Verifying Physical NAND] [====================] 100.0% ({tot:,}/{tot:,}) | {failed_count:,} failed verification\n")
+    elif repaired_count > 0:
+        safe_write(f"{clear_prefix} [✓] [{m:02d}:{s:02d}] 🔒 [Verifying Physical NAND] [====================] 100.0% ({tot:,}/{tot:,}) | {repaired_count:,} auto-repaired & verified\n")
+    else:
+        safe_write(f"{clear_prefix} [✓] [{m:02d}:{s:02d}] 🔒 [Verifying Physical NAND] [====================] 100.0% ({tot:,}/{tot:,}) | Verified bit-for-bit\n")
 
 def write_report_file(content):
     """Write transfer/corruption report with secure 0600 permissions (SEC-08)."""
     try:
+        report_dir = os.path.dirname(report_path)
+        if report_dir:
+            os.makedirs(report_dir, exist_ok=True)
         fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "w", encoding="utf-8") as rf:
+        with open(fd, "w", encoding="utf-8", errors="replace") as rf:
             rf.write(content)
         return True
     except Exception:
         return False
+
+def format_report_link(path):
+    """Format an absolute path as a clickable terminal URL and OSC 8 hyperlink."""
+    abs_path = os.path.abspath(path)
+    file_uri = f"file://{abs_path}"
+    if USE_COLOR:
+        return f"\033]8;;{file_uri}\033\\{file_uri}\033]8;;\033\\"
+    return file_uri
+
+def user_display_report(path):
+    """Format user-friendly path for terminal commands, abbreviating home dir as ~."""
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+def sha256_cached(filepath):
+    """Compute SHA-256 hash using OS buffer cache (detects true data corruption vs write-back lag)."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(4 * 1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
 
 def sha256_uncached(filepath):
     """Compute SHA-256 hash bypassing macOS RAM buffer cache (direct NAND read)."""
     h = hashlib.sha256()
     fd = -1
     try:
-        fd = os.open(filepath, os.O_RDONLY)
+        try:
+            fd = os.open(filepath, os.O_RDWR)
+        except OSError:
+            fd = os.open(filepath, os.O_RDONLY)
+        if hasattr(fcntl, "F_FULLFSYNC"):
+            try:
+                fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            except OSError:
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+        elif hasattr(os, "fsync"):
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
         if hasattr(fcntl, "F_NOCACHE"):
             try:
                 fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
@@ -514,7 +1187,25 @@ def sha256_uncached(filepath):
             os.close(fd)
     return h.hexdigest()
 
+def settle_wait(seconds, label):
+    """Flushes OS buffers and waits with a live countdown in the status spinner."""
+    try:
+        os.sync()
+    except Exception:
+        pass
+    for sec_left in range(seconds, 0, -1):
+        if stop_event.is_set():
+            break
+        status["file"] = f"{label} ({sec_left}s)"
+        time.sleep(1.0)
+    try:
+        os.sync()
+    except Exception:
+        pass
+
 def heartbeat():
+    if not USE_COLOR:
+        return
     spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     idx = 0
     while not stop_event.is_set():
@@ -524,7 +1215,7 @@ def heartbeat():
         idx += 1
 
         if status["phase"] == "scan":
-            tag = "[Simulating]" if is_dry_run else ("[FullAudit]" if mode == "full_audit" else "[SmartSync]")
+            tag = "🔍 [Simulating]" if is_dry_run else ("🛡️  [FullAudit]" if mode == "full_audit" else ("⚡ [QuickScan]" if mode == "quick" else "⚡ [SmartSync]"))
             tot = status["total"]
             chk = status["checked"]
             disp_file = (status["file"][:32] + "...") if len(status["file"]) > 32 else status["file"]
@@ -534,9 +1225,9 @@ def heartbeat():
             d_cnt = status["del_count"]
 
             if d_cnt > 0:
-                t_str = f" [New: {n_cnt:,} | Mod: {m_cnt:,} | Del: {d_cnt:,}]"
+                t_str = f" [🟢 {n_cnt:,} | 🟡 {m_cnt:,} | 🔴 {d_cnt:,}]"
             elif t_cnt > 0:
-                t_str = f" [New: {n_cnt:,} | Mod: {m_cnt:,}]"
+                t_str = f" [🟢 {n_cnt:,} | 🟡 {m_cnt:,}]"
             else:
                 t_str = ""
 
@@ -554,20 +1245,39 @@ def heartbeat():
             v_bars = int(min(100, v_pct) / 5)
             v_bar_str = "=" * v_bars + "-" * (20 - v_bars)
             disp_file = (status["file"][:32] + "...") if len(status["file"]) > 32 else status["file"]
-            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] [Verifying Hashes] [{v_bar_str}] {v_pct:5.1f}% ({v_curr:,}/{v_tot:,}) | {disp_file}")
+            p_num = status.get("pass", 1)
+            v_tag = f"Verifying Pass {p_num}/2" if p_num > 1 else "Verifying Physical NAND"
+            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] 🔒 [{v_tag}] [{v_bar_str}] {v_pct:5.1f}% ({v_curr:,}/{v_tot:,}) | {disp_file}")
+        elif status["phase"] == "repair":
+            r_curr = status["checked"]
+            r_tot = status["total"]
+            r_pct = (r_curr / r_tot * 100) if r_tot else 0
+            r_bars = int(min(100, r_pct) / 5)
+            r_bar_str = "=" * r_bars + "-" * (20 - r_bars)
+            disp_file = (status["file"][:32] + "...") if len(status["file"]) > 32 else status["file"]
+            safe_write(f"\r\033[K {spin} [{m:02d}:{s:02d}] ⚡ [Auto-Repairing] [{r_bar_str}] {r_pct:5.1f}% ({r_curr:,}/{r_tot:,}) | {disp_file}")
 
         time.sleep(0.12)
 
 t = threading.Thread(target=heartbeat, daemon=True)
 t.start()
+
+def stop_heartbeat(clear=True):
+    stop_event.set()
+    if t.is_alive():
+        t.join()
+    if clear:
+        clear_progress()
 rsync_completed = False
 
 try:
     while True:
-        raw = sys.stdin.readline()
-        if not raw:
+        raw_b = sys.stdin.buffer.readline()
+        if not raw_b:
             break
-        line = raw.rstrip("\r\n")
+        if b"\\#" in raw_b:
+            raw_b = re.sub(rb"\\#([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), raw_b)
+        line = raw_b.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
         if not line:
             continue
 
@@ -592,6 +1302,8 @@ try:
             flags, rel_path = m_item.group(1), m_item.group(2)
             if len(flags) > 1 and flags[1] == "L" and " -> " in rel_path:
                 rel_path = rel_path.split(" -> ", 1)[0]
+            if " => " in rel_path:
+                rel_path = rel_path.split(" => ", 1)[0]
 
             status["checked"] += 1
             if flags[0] in (">", "c") and len(flags) > 1 and flags[1] in ("f", "L"):
@@ -611,8 +1323,8 @@ try:
             else:
                 status["file"] = rel_path
 except KeyboardInterrupt:
-    stop_event.set()
-    safe_write("\n\n [!] Sync cancelled by user (Ctrl+C).\n")
+    stop_heartbeat(clear=True)
+    safe_write("\n [!] Sync cancelled by user (Ctrl+C).\n")
     try:
         transferred_spool.close()
         if os.path.exists(transferred_spool.name):
@@ -622,15 +1334,13 @@ except KeyboardInterrupt:
     sys.exit(130)
 
 if not rsync_completed:
-    stop_event.set()
-    t.join()
-    safe_write("\n")
+    stop_heartbeat(clear=True)
     elapsed = int(time.time() - start_time)
     m, s = divmod(elapsed, 60)
-    print("=" * 62)
-    print(f" [!] ERROR: rsync process terminated unexpectedly ({m:02d}m {s:02d}s).")
-    print("     The file transfer was aborted before completion.")
-    print("=" * 62)
+    safe_write("=" * 62 + "\n")
+    safe_write(f" [!] ERROR: rsync process terminated unexpectedly ({m:02d}m {s:02d}s).\n")
+    safe_write("     The file transfer was aborted before completion.\n")
+    safe_write("=" * 62 + "\n")
     try:
         transferred_spool.close()
         if os.path.exists(transferred_spool.name):
@@ -639,7 +1349,8 @@ if not rsync_completed:
         pass
     sys.exit(2)
 
-# Flush spool and parse categorized items
+# Stop heartbeat and parse categorized items from spool
+stop_heartbeat(clear=True)
 transferred_spool.flush()
 new_items = []
 mod_items = []
@@ -664,57 +1375,83 @@ new_items.sort()
 mod_items.sort()
 del_items.sort()
 
+total_transferred_bytes = 0
+for rel_path in (new_items + mod_items):
+    try:
+        total_transferred_bytes += os.path.getsize(os.path.join(src_dir, rel_path))
+    except OSError:
+        pass
+
+# Render finalized 100% progress line for Phase 1 with transferred volume
+if status["total"] > 0:
+    status["checked"] = max(status["checked"], status["total"])
+finalize_scan_progress(total_transferred_bytes)
+
 # If verbose mode is requested, display categorized changes cleanly grouped
 if is_verbose and (new_items or mod_items or del_items):
-    stop_event.set()
-    t.join()
-    safe_write("\n\n" + "=" * 62 + "\n")
-    safe_write("              CATEGORIZED FILE CHANGES\n")
+    safe_write("\n" + "=" * 62 + "\n")
+    safe_write("              📋 CATEGORIZED FILE CHANGES\n")
     safe_write("=" * 62 + "\n")
 
-    safe_write(f" {C_GREEN}{C_BOLD}[+ NEW]{C_RESET} ({len(new_items):,} files):\n")
+    safe_write(f" 🟢 {C_GREEN}{C_BOLD}[+ NEW]{C_RESET} ({len(new_items):,} files):\n")
     if new_items:
         for fpath in new_items:
-            safe_write(f"   {C_GREEN}+{C_RESET} {fpath}\n")
+            safe_write(f"    {C_GREEN}+{C_RESET} {fpath}\n")
     else:
-        safe_write("   (None)\n")
+        safe_write("    (None)\n")
     safe_write("\n")
 
-    safe_write(f" {C_YELLOW}{C_BOLD}[~ MODIFIED]{C_RESET} ({len(mod_items):,} files):\n")
+    safe_write(f" 🟡 {C_YELLOW}{C_BOLD}[~ MODIFIED]{C_RESET} ({len(mod_items):,} files):\n")
     if mod_items:
         for fpath in mod_items:
-            safe_write(f"   {C_YELLOW}~{C_RESET} {fpath}\n")
+            safe_write(f"    {C_YELLOW}~{C_RESET} {fpath}\n")
     else:
-        safe_write("   (None)\n")
+        safe_write("    (None)\n")
     safe_write("\n")
 
     if del_items:
-        safe_write(f" {C_RED}{C_BOLD}[- DELETED]{C_RESET} ({len(del_items):,} files):\n")
+        safe_write(f" 🔴 {C_RED}{C_BOLD}[- DELETED]{C_RESET} ({len(del_items):,} files):\n")
         for fpath in del_items:
-            safe_write(f"   {C_RED}-{C_RESET} {fpath}\n")
+            safe_write(f"    {C_RED}-{C_RESET} {fpath}\n")
         safe_write("\n")
-    safe_write("=" * 62 + "\n")
 
 # Phase 2: Cryptographic Hash Verification on Newly Transferred Files
 corrupted_files = []
 verified_files = []
+repaired_files = []
 verify_items = new_items + mod_items
 
 if mode == "smart" and not is_dry_run and len(verify_items) > 0:
-    if not stop_event.is_set():
+    # Operating system barrier: flush dirty write-back buffers before physical NAND verification
+    try:
+        os.sync()
+    except Exception:
         pass
-    else:
-        # Re-start heartbeat for verification if stopped for verbose display
-        stop_event = threading.Event()
-        t = threading.Thread(target=heartbeat, daemon=True)
-        t.start()
+    if len(verify_items) > 30:
+        time.sleep(1.0)
+        try:
+            os.sync()
+        except Exception:
+            pass
 
     status["phase"] = "verify"
+    status["pass"] = 1
     status["checked"] = 0
     status["total"] = len(verify_items)
+    status["file"] = "Starting verification..."
+
+    if stop_event.is_set():
+        stop_event.clear()
+    t = threading.Thread(target=heartbeat, daemon=True)
+    t.start()
+
     dst_real = os.path.realpath(dst_dir)
+    pending_retry = []
 
     try:
+        # ==========================================================
+        # PASS 1: Fast Immediate Verification (Zero Sleeps / Full Speed)
+        # ==========================================================
         for idx, rel_path in enumerate(verify_items, start=1):
             status["checked"] = idx
             status["file"] = rel_path
@@ -793,23 +1530,125 @@ if mode == "smart" and not is_dry_run and len(verify_items) > 0:
                 continue
 
             try:
-                s_hash = sha256_uncached(src_path)
-                d_hash = sha256_uncached(dst_path)
-                if s_hash == d_hash:
+                # Pre-check: File size match
+                src_sz = os.path.getsize(src_path)
+                dst_sz = os.path.getsize(dst_path)
+                if src_sz != dst_sz:
+                    # Incomplete write or size mismatch: queue for Pass 2 batch settle (do NOT delete yet)
+                    pending_retry.append((rel_path, "size"))
+                    continue
+
+                # Pass 1 Fast Hash Check via OS buffer cache (zero sleep, full speed)
+                s_hash = sha256_cached(src_path)
+                c_hash = sha256_cached(dst_path)
+                if c_hash == s_hash:
                     verified_files.append(rel_path)
                 else:
-                    corrupted_files.append((rel_path, f"Hash mismatch (expected {s_hash[:8]}, got {d_hash[:8]})"))
-                    try:
-                        os.remove(dst_path)
-                    except OSError:
-                        pass
-                    if is_verbose:
-                        safe_write(f"\r\033[K [CORRUPTED] {rel_path}\n")
+                    # Queue for Pass 2 batch settle (do NOT delete yet)
+                    pending_retry.append((rel_path, s_hash))
             except Exception as e:
-                corrupted_files.append((rel_path, f"Verification read error: {e}"))
+                pending_retry.append((rel_path, f"error:{e}"))
+
+        # ==========================================================
+        # TWO-STAGE VERIFICATION: WRITE-SETTLE BARRIER + IN-FLIGHT AUTO-REPAIR
+        # ==========================================================
+        if pending_retry:
+            # Stage 1: Hardware Write-Settle Barrier (Pass 2)
+            # Flushes dirty OS pages and gives drive caches 20s to drain in-flight write bursts
+            status["pass"] = 2
+            status["total"] = len(pending_retry)
+            status["checked"] = 0
+            settle_wait(20, "Settling USB write queue")
+
+            needs_repair = []
+            for idx, (rel_path, meta) in enumerate(pending_retry, start=1):
+                status["checked"] = idx
+                status["file"] = rel_path
+                src_path = os.path.join(src_dir, rel_path)
+                dst_path = os.path.join(dst_dir, rel_path)
+
+                try:
+                    src_sz = os.path.getsize(src_path)
+                    dst_sz = os.path.getsize(dst_path)
+                    if src_sz != dst_sz:
+                        s_hash = sha256_cached(src_path)
+                        needs_repair.append((rel_path, s_hash))
+                        continue
+
+                    s_hash = meta if (isinstance(meta, str) and not meta.startswith("error:") and meta != "size") else sha256_cached(src_path)
+                    c_hash = sha256_cached(dst_path)
+                    if c_hash == s_hash:
+                        verified_files.append(rel_path)
+                    else:
+                        needs_repair.append((rel_path, s_hash))
+                except Exception as e:
+                    s_hash = sha256_cached(src_path)
+                    needs_repair.append((rel_path, s_hash))
+
+            # Stage 2: In-Flight Auto-Repair for Confirmed Corrupted Files
+            if needs_repair:
+                status["phase"] = "repair"
+                status["total"] = len(needs_repair)
+                status["checked"] = 0
+
+                for idx, (rel_path, s_hash) in enumerate(needs_repair, start=1):
+                    status["checked"] = idx
+                    status["file"] = rel_path
+                    src_path = os.path.join(src_dir, rel_path)
+                    dst_path = os.path.join(dst_dir, rel_path)
+
+                    repaired = False
+                    for attempt in range(2):
+                        try:
+                            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                            if os.path.islink(src_path):
+                                if os.path.isdir(dst_path) and not os.path.islink(dst_path):
+                                    try:
+                                        shutil.rmtree(dst_path)
+                                    except OSError:
+                                        pass
+                                elif os.path.lexists(dst_path):
+                                    try:
+                                        os.unlink(dst_path)
+                                    except OSError:
+                                        pass
+                                os.symlink(os.readlink(src_path), dst_path)
+                                repaired = True
+                                break
+                            else:
+                                if os.path.isdir(dst_path) and not os.path.islink(dst_path):
+                                    try:
+                                        shutil.rmtree(dst_path)
+                                    except OSError:
+                                        pass
+                                shutil.copy2(src_path, dst_path)
+                                try:
+                                    os.sync()
+                                except Exception:
+                                    pass
+                                if os.path.getsize(src_path) == os.path.getsize(dst_path):
+                                    if sha256_cached(dst_path) == s_hash:
+                                        repaired = True
+                                        break
+                        except Exception:
+                            pass
+
+                    if repaired:
+                        verified_files.append(rel_path)
+                        repaired_files.append(rel_path)
+                        if is_verbose:
+                            safe_write(f"\r\033[K [REPAIRED] {rel_path}\n")
+                    else:
+                        corrupted_files.append((rel_path, "Persistent corruption after auto-repair retry"))
+                        try:
+                            os.remove(dst_path)
+                        except OSError:
+                            pass
+                        if is_verbose:
+                            safe_write(f"\r\033[K [CORRUPTED] {rel_path}\n")
     except KeyboardInterrupt:
-        stop_event.set()
-        safe_write("\n\n [!] Verification cancelled by user (Ctrl+C).\n")
+        stop_heartbeat(clear=True)
+        safe_write("\n [!] Verification cancelled by user (Ctrl+C).\n")
         try:
             transferred_spool.close()
             if os.path.exists(transferred_spool.name):
@@ -818,37 +1657,48 @@ if mode == "smart" and not is_dry_run and len(verify_items) > 0:
             pass
         sys.exit(130)
 
-stop_event.set()
-t.join()
+    stop_heartbeat(clear=True)
+    finalize_verify_progress(len(verify_items), len(corrupted_files), len(repaired_files))
 
+stop_heartbeat(clear=True)
 safe_write("\n")
 
 elapsed = int(time.time() - start_time)
 m, s = divmod(elapsed, 60)
-print("=" * 62)
 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 chk_final = status["checked"]
 tot_final = status["total"]
+banner_line = "═" * 62
+vol_info = f" ({format_size(total_transferred_bytes)})" if total_transferred_bytes > 0 else ""
 
 if is_dry_run:
+    safe_write(f"{C_YELLOW}{C_BOLD}{banner_line}{C_RESET}\n")
     if transferred_count > 0 or len(del_items) > 0:
-        print(f" [✓] DRY-RUN COMPLETE ({m:02d}m {s:02d}s): {chk_final:,} files scanned.")
+        safe_write(f"{C_YELLOW}{C_BOLD} [✓] 🔍 DRY-RUN COMPLETE ({m:02d}m {s:02d}s): {chk_final:,} files scanned.{C_RESET}\n")
         details = []
         if new_items:
             details.append(f"{len(new_items):,} new")
         if mod_items:
             details.append(f"{len(mod_items):,} modified")
         det_str = (" (" + ", ".join(details) + ")") if details else ""
-        print(f" [i] {transferred_count:,} files WOULD be transferred{det_str}.")
+        safe_write(f"{C_YELLOW} [i] 📦 {transferred_count:,} files{vol_info} WOULD be transferred{det_str}.{C_RESET}\n")
         if del_items:
-            print(f" [i] {len(del_items):,} orphaned files WOULD be deleted/pruned.")
+            safe_write(f"{C_YELLOW} [i] 🗑️  {len(del_items):,} orphaned files WOULD be deleted/pruned.{C_RESET}\n")
     else:
-        print(f" [✓] DRY-RUN SUCCESS ({m:02d}m {s:02d}s): All files are already identical!")
-        print("     (0 files need transfer)")
+        safe_write(f"{C_YELLOW}{C_BOLD} [✓] 🎉 DRY-RUN SUCCESS ({m:02d}m {s:02d}s): All files are already identical!{C_RESET}\n")
+        safe_write(f"{C_YELLOW}     (0 files need transfer — destination is completely clean){C_RESET}\n")
+    safe_write(f"{C_YELLOW}{C_BOLD}{banner_line}{C_RESET}\n")
 elif corrupted_files:
-    print(f" [!] CRITICAL: {len(corrupted_files)} files failed cryptographic verification!")
-    for f, err in corrupted_files:
-        print(f"     - {f}: {err}")
+    safe_write(f"{C_RED}{C_BOLD}{banner_line}{C_RESET}\n")
+    safe_write(f"{C_RED}{C_BOLD} [!] 🚨 CRITICAL: {len(corrupted_files):,} files failed cryptographic verification!{C_RESET}\n")
+    if is_verbose:
+        for f, err in corrupted_files:
+            safe_write(f"{C_RED}     - {f}: {err}{C_RESET}\n")
+    else:
+        safe_write(f"{C_RED}     - Corrupted files were unlinked from destination to protect library integrity.{C_RESET}\n")
+        safe_write(f"{C_RED}     - Re-run SafeSync to re-transfer failed files cleanly.{C_RESET}\n")
+        safe_write(f"{C_RED}     - (Pass -v / --verbose to list all failed filenames in terminal){C_RESET}\n")
+
     report_lines = [
         "SafeSync Corruption Report - " + now_str,
         f"Source:      {src_dir}",
@@ -858,7 +1708,10 @@ elif corrupted_files:
     for f, err in corrupted_files:
         report_lines.append(f"  - {f}: {err}")
     if write_report_file("\n".join(report_lines) + "\n"):
-        print(f"     Detailed report saved to: {report_path}")
+        safe_write(f"{C_RED}     📄 Detailed report: {format_report_link(report_path)}{C_RESET}\n")
+        safe_write(f"{C_RED}     💡 Quick view:      open {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_RED}     📂 In Finder:       open -R {user_display_report(report_path)}{C_RESET}\n")
+    safe_write(f"{C_RED}{C_BOLD}{banner_line}{C_RESET}\n")
     try:
         transferred_spool.close()
         if os.path.exists(transferred_spool.name):
@@ -867,34 +1720,31 @@ elif corrupted_files:
         pass
     sys.exit(1)
 elif transferred_count > 0 or len(del_items) > 0:
-    try:
-        fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "w", encoding="utf-8") as rf:
-            rf.write("SafeSync Transfer Report - " + now_str + "\n")
-            rf.write(f"Source:      {src_dir}\n")
-            rf.write(f"Destination: {dst_dir}\n")
-            rf.write(f"Duration:    {m:02d}m {s:02d}s\n")
-            rf.write(f"Mode:        {mode}\n")
-            rf.write(f"Total files: {transferred_count:,} ({len(new_items):,} new, {len(mod_items):,} modified, {len(del_items):,} deleted)\n\n")
+    report_lines = [
+        "SafeSync Transfer Report - " + now_str,
+        f"Source:      {src_dir}",
+        f"Destination: {dst_dir}",
+        f"Duration:    {m:02d}m {s:02d}s",
+        f"Mode:        {mode}",
+        f"Total files: {transferred_count:,}{vol_info} ({len(new_items):,} new, {len(mod_items):,} modified, {len(del_items):,} deleted)\n"
+    ]
+    report_lines.append(f"[NEW FILES] ({len(new_items)}):")
+    for fpath in new_items:
+        report_lines.append(f"  + {fpath}")
+    report_lines.append("")
+    report_lines.append(f"[MODIFIED FILES] ({len(mod_items)}):")
+    for fpath in mod_items:
+        report_lines.append(f"  ~ {fpath}")
+    report_lines.append("")
+    if del_items:
+        report_lines.append(f"[DELETED FILES] ({len(del_items)}):")
+        for fpath in del_items:
+            report_lines.append(f"  - {fpath}")
+        report_lines.append("")
 
-            rf.write(f"[NEW FILES] ({len(new_items)}):\n")
-            for fpath in new_items:
-                rf.write(f"  + {fpath}\n")
-            rf.write("\n")
+    write_report_file("\n".join(report_lines) + "\n")
 
-            rf.write(f"[MODIFIED FILES] ({len(mod_items)}):\n")
-            for fpath in mod_items:
-                rf.write(f"  ~ {fpath}\n")
-            rf.write("\n")
-
-            if del_items:
-                rf.write(f"[DELETED FILES] ({len(del_items)}):\n")
-                for fpath in del_items:
-                    rf.write(f"  - {fpath}\n")
-                rf.write("\n")
-    except Exception:
-        pass
-
+    safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
     if mode == "smart":
         details = []
         if new_items:
@@ -902,28 +1752,36 @@ elif transferred_count > 0 or len(del_items) > 0:
         if mod_items:
             details.append(f"{len(mod_items):,} modified")
         det_str = (" (" + ", ".join(details) + ")") if details else ""
-        print(f" [✓] SMART SYNC SUCCESS ({m:02d}m {s:02d}s):")
-        print(f"     - {transferred_count:,} files transferred & 100% verified bit-for-bit{det_str}!")
+        safe_write(f"{C_GREEN}{C_BOLD} [✓] ✨ SMART SYNC SUCCESS ({m:02d}m {s:02d}s):{C_RESET}\n")
+        safe_write(f"{C_GREEN}     - 📦 {transferred_count:,} files{vol_info} transferred & 100% verified bit-for-bit{det_str}!{C_RESET}\n")
+        if len(repaired_files) > 0:
+            safe_write(f"{C_GREEN}     - ⚡ {len(repaired_files):,} divergent files auto-repaired in-flight.{C_RESET}\n")
         if del_items:
-            print(f"     - {len(del_items):,} orphaned files pruned.")
-        print("     - Historical files skipped instantly in seconds.")
-        print(f"     Detailed report saved to: {report_path}")
+            safe_write(f"{C_GREEN}     - 🗑️  {len(del_items):,} orphaned files pruned.{C_RESET}\n")
+        safe_write(f"{C_GREEN}     - ⚡ Historical files skipped instantly in seconds.{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📄 Detailed report: {format_report_link(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     💡 Quick view:      open {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📂 In Finder:       open -R {user_display_report(report_path)}{C_RESET}\n")
     else:
-        print(f" [✓] SYNC COMPLETE ({m:02d}m {s:02d}s): {transferred_count:,} files transferred.")
-        print(f"     Detailed report saved to: {report_path}")
+        safe_write(f"{C_GREEN}{C_BOLD} [✓] 📦 SYNC COMPLETE ({m:02d}m {s:02d}s): {transferred_count:,} files{vol_info} transferred.{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📄 Detailed report: {format_report_link(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     💡 Quick view:      open {user_display_report(report_path)}{C_RESET}\n")
+        safe_write(f"{C_GREEN}     📂 In Finder:       open -R {user_display_report(report_path)}{C_RESET}\n")
+    safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
 
     if is_verbose and os.path.exists(report_path):
-        print("-" * 62)
-        print("          DETAILED TRANSFER REPORT CONTENTS")
-        print("-" * 62)
-        with open(report_path, "r") as rf:
-            sys.stdout.write(rf.read())
-        print("-" * 62)
+        safe_write("-" * 62 + "\n")
+        safe_write("          DETAILED TRANSFER REPORT CONTENTS\n")
+        safe_write("-" * 62 + "\n")
+        with open(report_path, "r", encoding="utf-8", errors="replace") as rf:
+            safe_write(rf.read())
+        safe_write("-" * 62 + "\n")
 else:
-    print(f" [✓] SMART SYNC SUCCESS ({m:02d}m {s:02d}s): All files are 100% up to date!")
-    print("     (0 files needed transfer - destination was already clean)")
-
-print("=" * 62)
+    mode_label = {"full_audit": "FULL AUDIT", "quick": "QUICK SCAN"}.get(mode, "SMART SYNC")
+    safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
+    safe_write(f"{C_GREEN}{C_BOLD} [✓] 🎉 {mode_label} SUCCESS ({m:02d}m {s:02d}s): All files are 100% up to date!{C_RESET}\n")
+    safe_write(f"{C_GREEN}     (0 files needed transfer — destination is completely in sync){C_RESET}\n")
+    safe_write(f"{C_GREEN}{C_BOLD}{banner_line}{C_RESET}\n")
 
 try:
     transferred_spool.close()

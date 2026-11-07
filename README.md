@@ -1,10 +1,11 @@
 # SafeSync 🛡️
 
-> **Hardened, air-gapped media backup for macOS.**  
+> **Hardened, air-gapped media backup utility exclusively engineered for macOS (Sonoma, Sequoia, and newer).**  
 > Zero silent corruption, thermal throttling protection, and automatic cryptographic verification for external SSDs.
 
-[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://apple.com/macos)
-[![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#dependencies)
+[![Platform](https://img.shields.io/badge/platform-macOS%20only-lightgrey.svg)](https://apple.com/macos)
+[![macOS Version](https://img.shields.io/badge/macOS-Sonoma%20%7C%20Sequoia-blue.svg)](https://apple.com/macos)
+[![Dependencies](https://img.shields.io/badge/dependencies-none%20(zero%20installs)-brightgreen.svg)](#dependencies)
 [![Privacy](https://img.shields.io/badge/privacy-100%25%20offline-blue.svg)](#privacy--security)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -21,7 +22,7 @@ Even when modern external NVMe SSDs (such as the Samsung T7, SanDisk Extreme, or
 ### 🛡️ How SafeSync Solves This
 SafeSync was engineered specifically to eliminate these hardware and operating system failure modes:
 - **Thermal-Safe Rate Limiting:** Default throttled transfer speed (`120 MB/s`) keeps external drive bridge controllers cool and prevents USB bus voltage drops.
-- **Uncached Cryptographic Verification:** All new files are verified using `fcntl(F_NOCACHE)` SHA-256 hashes—bypassing macOS RAM cache to read directly from physical NAND flash silicon.
+- **Two-Stage Verification with In-Flight Auto-Repair:** All transferred files undergo physical commit synchronization (`fcntl.F_FULLFSYNC` + `os.sync()`) and direct physical silicon reads (`fcntl.F_NOCACHE`) for SHA-256 verification. If write-back lag occurs during multi-gigabyte bursts, an initial 20-second hardware settle barrier gives drive caches time to drain in-flight pages. If any file suffers in-flight USB bus packet corruption, SafeSync immediately re-transfers that specific file directly and re-verifies it bit-for-bit in seconds—completely eliminating multi-minute idle waits and ensuring zero silent corruption.
 - **Photos Library & macOS Bundle Intelligence:** Automatically ignores transient Apple daemon cache journals, normalizes paths to prevent nested bundles, and enforces safety boundaries with zero third-party dependencies.
 
 ---
@@ -71,8 +72,8 @@ USAGE:
 OPTIONS:
   (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
                        of all newly transferred files. Perfect for routine backups!
-  -a, --full-audit     Full Audit / Scrub Mode. Runs cryptographic checksum verification across 100%
-                       of historical files via rsync (recommended periodically or before wiping a Mac).
+  -a, --full-audit     Full Audit / Scrub Mode. 3-step cryptographic audit (Source Baseline -> Destination
+                       NAND Scrub with 5 GB thermal firebreaks -> Bit-for-bit verification & auto-repair).
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
   -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
   -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
@@ -127,23 +128,45 @@ safesync -v "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/
 
 ## The Terminal Dashboard
 
-During execution, `safesync` displays an in-place, unbuffered progress bar driven by a background heartbeat thread:
+During execution, `safesync` displays an in-place, unbuffered progress bar driven by a background heartbeat thread, and upon completion commits a static **100% completed progress bar** directly to your terminal history:
 
 ```text
- ⠋ [01:15] [SmartSync] [==========----------] 52.0% (14,200/27,297) [New/Mod: 42] | originals/2/228F1A3E.mov
+# 1. Live Transfer Progress:
+ [✓] [01:15] ⚡ [SmartSync] [====================] 100.0% (27,297/27,297) [🟢 40 | 🟡 2] | Transfer complete [6.3 GB]
+
+# 2. Direct Physical NAND Verification:
+ [✓] [01:45] 🔒 [Verifying Physical NAND] [====================] 100.0% (42/42) | Verified bit-for-bit
+
+# 3. High-Visibility Final Outcome Banner (Green for Success, Yellow for Simulation, Red for Issues):
+══════════════════════════════════════════════════════════════
+ [✓] ✨ SMART SYNC SUCCESS (01m 45s):
+     - 📦 42 files (6.3 GB) transferred & 100% verified bit-for-bit (40 new, 2 modified)!
+     - ⚡ Historical files skipped instantly in seconds.
+     📄 Detailed report: file:///Users/<username>/Library/Logs/safesync/safesync_report.txt
+     💡 Quick view:      open ~/Library/Logs/safesync/safesync_report.txt
+     📂 In Finder:       open -R ~/Library/Logs/safesync/safesync_report.txt
+══════════════════════════════════════════════════════════════
 ```
 
-Followed by automatic hash verification of all new files:
-```text
- ⠋ [01:45] [Verifying Hashes] [====================] 100.0% (42/42) | originals/2/228F1A3E.mov
-```
-
-* **`⠋ ⠙ ⠹...`:** Active drive heartbeat (spins continuously even while multi-gigabyte video files hash).
+* **`[✓]`:** Static completion checkmark (replaces the active spinner `⠋` when the phase completes).
 * **`[01:15]`:** Real-time elapsed timer.
-* **`[SmartSync]`:** Active mode indicator (`[Simulating]`, `[FullAudit]`, or `[SmartSync]`).
-* **`[===---]`:** Visual completion bar.
-* **`[New/Mod: 42]`:** Live count of new or modified files transferred.
-* **`originals/...mov`:** Active file currently being checked.
+* **`⚡ [SmartSync]`:** Active mode indicator (`🔍 [Simulating]`, `🛡️  [FullAudit]`, or `⚡ [SmartSync]`).
+* **`[====================]`:** High-contrast 20-character visual progress bar.
+* **`[🟢 40 | 🟡 2]`:** Categorized breakdown of **🟢 New** and **🟡 Modified** files.
+* **`[6.3 GB]`:** Real-time human-readable volume of data transferred (in B, KB, MB, GB, or TB).
+* **`Verified bit-for-bit`:** Confirmation of direct NAND hash verification bypassing macOS RAM cache.
+* **Theme-Adaptive Dimming:** Metadata headers utilize ANSI SGR 2 (`\033[2m`) to subtly dim configuration details across dark, light, and solarized palettes.
+* **Yellow Attention Gates:** Prompts awaiting user approval (such as creating a new destination folder) are framed in bold yellow border boxes.
+
+### 📄 Audit & Transfer Reports
+
+After every operation, SafeSync writes a full audit report to the macOS standard logging folder:
+```
+~/Library/Logs/safesync/safesync_report.txt
+```
+- Saved with secure `0600` permissions (owner read/write only).
+- Stays neatly out of sight from your Desktop.
+- Easily inspected anytime via `cat ~/Library/Logs/safesync/safesync_report.txt` or opened in macOS Console / TextEdit via `open ~/Library/Logs/safesync/safesync_report.txt`.
 
 ---
 
