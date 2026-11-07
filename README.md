@@ -10,6 +10,22 @@
 
 ---
 
+## ⚠️ The Silent Corruption Problem: Why Fast SSDs Corrupt Media
+
+Even when modern external NVMe SSDs (such as the Samsung T7, SanDisk Extreme, or Crucial X-Series) advertise high-speed ratings of 1,050–2,800 MB/s, operating sustained high-throughput transfers—especially on drives with **APFS Encryption** enabled—frequently leads to **silent data corruption**:
+
+1. **Thermal Sags & Silent Packet Drops:** Sustained, unthrottled burst writes heat compact external drive controllers past 70°C. To prevent thermal shutdown, the controller aggressively throttles voltage and I/O. Under sustained load combined with on-the-fly APFS encryption, USB packet drops and bus resets occur silently without throwing OS error codes. Corrupted blocks are written to physical NAND flash—leaving permanent **horizontal grey or black bars across high-resolution photos, frame tearing in 4K videos, or damaged SQLite databases inside `.photoslibrary` bundles**.
+2. **The macOS RAM Buffer Deception:** macOS buffers file writes in the Unified Buffer Cache in RAM. If you run standard checksum or copy verification tools immediately after a transfer, macOS reads the clean file copies lingering in RAM rather than reading the physical SSD silicon. The verification tool gives a false-positive **100% MATCH**, leading you to believe your backup succeeded, only to discover corrupted photos months later when it is too late.
+3. **Apple Photos Library Traps:** Backing up live Apple Photos libraries (`.photoslibrary`) with standard tools risks creating nested library folders, crashing on volatile daemon cache journals (`photolibraryd`, `photoanalysisd`), or littering AppleDouble `._*` sidecar files that corrupt library databases.
+
+### 🛡️ How SafeSync Solves This
+SafeSync was engineered specifically to eliminate these hardware and operating system failure modes:
+- **Thermal-Safe Rate Limiting:** Default throttled transfer speed (`120 MB/s`) keeps external drive bridge controllers cool and prevents USB bus voltage drops.
+- **Uncached Cryptographic Verification:** All new files are verified using `fcntl(F_NOCACHE)` SHA-256 hashes—bypassing macOS RAM cache to read directly from physical NAND flash silicon.
+- **Photos Library & macOS Bundle Intelligence:** Automatically ignores transient Apple daemon cache journals, normalizes paths to prevent nested bundles, and enforces safety boundaries with zero third-party dependencies.
+
+---
+
 ## ⚡ The Default Mode: Smart Incremental
 
 **You don't need to remember any complex flags!** By default, running:
@@ -41,6 +57,8 @@ safesync "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/Bac
 
 > [!TIP]
 > **No trailing-slash anxiety!** `safesync` automatically normalizes folder paths behind the scenes.
+>
+> **Finder Drag-and-Drop Tip:** When you drag a folder into Terminal, macOS automatically escapes spaces with backslashes (e.g. `Photos\ Library.photoslibrary`). Leave it as is—do **not** remove the slashes or add extra quotes, it works out of the box!
 
 ---
 
@@ -58,6 +76,8 @@ OPTIONS:
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
   -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
   -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
+  -p, --prune          Prune / Mirror mode. Deletes files from destination that no longer exist in
+                       source (gated behind confirmation to protect against accidental loss).
   -v, --verbose        Verbose mode. Streams per-file logs and displays full transfer report in terminal.
   -b, --bw <LIMIT>     Bandwidth rate limit (e.g. 120M, 250M, 50M). Default is 120M (thermal-safe).
   -m, --max, --full    Uncapped full throttle (no bandwidth limit). Recommended for transfers < 20 GB.
@@ -88,12 +108,17 @@ safesync -d "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/
 safesync -i "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
-#### 5. Small Transfer (< 20 GB) at Full Throttle
+#### 5. Mirror / Prune Backup (Cleans up deleted files at destination)
+```bash
+safesync -p "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
+```
+
+#### 6. Small Transfer (< 20 GB) at Full Throttle
 ```bash
 safesync -m "/Users/<username>/Movies/Trip_Video" "/Volumes/BackupSSD/Trip_Video"
 ```
 
-#### 6. Verbose Mode with Report Displayed in Terminal
+#### 7. Verbose Mode with Report Displayed in Terminal
 ```bash
 safesync -v "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
