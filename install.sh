@@ -29,10 +29,21 @@ INSTALL_TYPE="path"
 if [[ -d "$TARGET_DIR" && -w "$TARGET_DIR" ]]; then
   cp "$BIN_SRC" "${TARGET_DIR}/safesync"
   chmod +x "${TARGET_DIR}/safesync"
+  if [[ -f "${SCRIPT_DIR}/libexec/safesync-engine.py" ]]; then
+    mkdir -p "${HOME}/.local/libexec" 2>/dev/null || true
+    cp "${SCRIPT_DIR}/libexec/safesync-engine.py" "${HOME}/.local/libexec/safesync-engine.py" 2>/dev/null || true
+    cp "${SCRIPT_DIR}/libexec/safesync-engine.py" "${TARGET_DIR}/safesync-engine.py" 2>/dev/null || true
+    chmod +x "${HOME}/.local/libexec/safesync-engine.py" 2>/dev/null || true
+    chmod +x "${TARGET_DIR}/safesync-engine.py" 2>/dev/null || true
+  fi
   INSTALLED_PATH="${TARGET_DIR}/safesync"
 elif [[ -w "/usr/local/bin" ]]; then
   cp "$BIN_SRC" "/usr/local/bin/safesync"
   chmod +x "/usr/local/bin/safesync"
+  if [[ -f "${SCRIPT_DIR}/libexec/safesync-engine.py" ]]; then
+    cp "${SCRIPT_DIR}/libexec/safesync-engine.py" "/usr/local/bin/safesync-engine.py" 2>/dev/null || true
+    chmod +x "/usr/local/bin/safesync-engine.py" 2>/dev/null || true
+  fi
   INSTALLED_PATH="/usr/local/bin/safesync"
 else
   # Fallback to source path with prominent warning (SEC-18)

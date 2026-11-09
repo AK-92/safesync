@@ -1,10 +1,10 @@
 # SafeSync 🛡️
 
-> **Hardened, air-gapped media backup utility exclusively engineered for macOS (Sonoma, Sequoia, and newer).**  
+> **Hardened, air-gapped media backup utility exclusively engineered for macOS (14 and above, including macOS 26, 27+).**  
 > Zero silent corruption, thermal throttling protection, and automatic cryptographic verification for external SSDs.
 
 [![Platform](https://img.shields.io/badge/platform-macOS%20only-lightgrey.svg)](https://apple.com/macos)
-[![macOS Version](https://img.shields.io/badge/macOS-Sonoma%20%7C%20Sequoia-blue.svg)](https://apple.com/macos)
+[![macOS Version](https://img.shields.io/badge/macOS-14%20and%20above-blue.svg)](https://apple.com/macos)
 [![Dependencies](https://img.shields.io/badge/dependencies-none%20(zero%20installs)-brightgreen.svg)](#dependencies)
 [![Privacy](https://img.shields.io/badge/privacy-100%25%20offline-blue.svg)](#privacy--security)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -72,8 +72,8 @@ USAGE:
 OPTIONS:
   (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
                        of all newly transferred files. Perfect for routine backups!
-  -a, --full-audit     Full Audit / Scrub Mode. 3-step cryptographic audit (Source Baseline -> Destination
-                       NAND Scrub with 5 GB thermal firebreaks -> Bit-for-bit verification & auto-repair).
+  -a, --full-audit     Full Audit / Scrub Mode. Cryptographic audit (Source Baseline -> Destination
+                       Physical Scrub with 5 GB thermal firebreaks -> Bit-for-bit verification & auto-repair).
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
   -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
   -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
