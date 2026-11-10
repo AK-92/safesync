@@ -1,7 +1,6 @@
 # SafeSync 🛡️
 
-> **Hardened, air-gapped media backup utility exclusively engineered for macOS (14 and above, including macOS 26, 27+).**  
-> Zero silent corruption, thermal throttling protection, and automatic cryptographic verification for external SSDs.
+> **A macOS folder sync utility with optional SHA-256 comparison and repair.**
 
 [![Platform](https://img.shields.io/badge/platform-macOS%20only-lightgrey.svg)](https://apple.com/macos)
 [![macOS Version](https://img.shields.io/badge/macOS-14%20and%20above-blue.svg)](https://apple.com/macos)
@@ -11,19 +10,15 @@
 
 ---
 
-## ⚠️ The Silent Corruption Problem: Why Fast SSDs Corrupt Media
+## What SafeSync checks
 
-Even when modern external NVMe SSDs (such as the Samsung T7, SanDisk Extreme, or Crucial X-Series) advertise high-speed ratings of 1,050–2,800 MB/s, operating sustained high-throughput transfers—especially on drives with **APFS Encryption** enabled—frequently leads to **silent data corruption**:
+- Default sync uses rsync's normal size and modification-time comparisons to decide what to copy. It does not checksum files that rsync skips.
+- Newly copied files in smart mode are compared with SHA-256 hashes of the source and destination.
+- Full audit hashes the regular files it finds, reports content differences, and can replace mismatched destination files from the source.
+- A bandwidth limit controls rsync's transfer rate. It is not a thermal guarantee or a hardware corruption safeguard.
+- The optional macOS `F_NOCACHE` request avoids retaining hashed file data in the kernel file cache when supported. It cannot bypass a drive's controller cache or establish NAND-level durability.
 
-1. **Thermal Sags & Silent Packet Drops:** Sustained, unthrottled burst writes heat compact external drive controllers past 70°C. To prevent thermal shutdown, the controller aggressively throttles voltage and I/O. Under sustained load combined with on-the-fly APFS encryption, USB packet drops and bus resets occur silently without throwing OS error codes. Corrupted blocks are written to physical NAND flash—leaving permanent **horizontal grey or black bars across high-resolution photos, frame tearing in 4K videos, or damaged SQLite databases inside `.photoslibrary` bundles**.
-2. **The macOS RAM Buffer Deception:** macOS buffers file writes in the Unified Buffer Cache in RAM. If you run standard checksum or copy verification tools immediately after a transfer, macOS reads the clean file copies lingering in RAM rather than reading the physical SSD silicon. The verification tool gives a false-positive **100% MATCH**, leading you to believe your backup succeeded, only to discover corrupted photos months later when it is too late.
-3. **Apple Photos Library Traps:** Backing up live Apple Photos libraries (`.photoslibrary`) with standard tools risks creating nested library folders, crashing on volatile daemon cache journals (`photolibraryd`, `photoanalysisd`), or littering AppleDouble `._*` sidecar files that corrupt library databases.
-
-### 🛡️ How SafeSync Solves This
-SafeSync was engineered specifically to eliminate these hardware and operating system failure modes:
-- **Thermal-Safe Rate Limiting:** Default throttled transfer speed (`120 MB/s`) keeps external drive bridge controllers cool and prevents USB bus voltage drops.
-- **Two-Stage Verification with In-Flight Auto-Repair:** All transferred files undergo physical commit synchronization (`fcntl.F_FULLFSYNC` + `os.sync()`) and direct physical silicon reads (`fcntl.F_NOCACHE`) for SHA-256 verification. If write-back lag occurs during multi-gigabyte bursts, an initial 20-second hardware settle barrier gives drive caches time to drain in-flight pages. If any file suffers in-flight USB bus packet corruption, SafeSync immediately re-transfers that specific file directly and re-verifies it bit-for-bit in seconds—completely eliminating multi-minute idle waits and ensuring zero silent corruption.
-- **Photos Library & macOS Bundle Intelligence:** Automatically ignores transient Apple daemon cache journals, normalizes paths to prevent nested bundles, and enforces safety boundaries with zero third-party dependencies.
+For a consistent audit or backup, close applications that may be changing the source (including Photos for a Photos library) and wait for the operation to finish. Keep another independent backup. A checksum match verifies the bytes returned by the filesystem during that read; it does not certify the drive or cable.
 
 ---
 
@@ -36,10 +31,10 @@ safesync <SOURCE_FOLDER> <DESTINATION_FOLDER>
 ```
 
 executes **Smart Incremental Mode**:
-1. **Instant Skip for Historical Files:** Scans 50–100+ GB of older, unchanged media by size and timestamp in **~5 to 10 seconds**.
-2. **Thermal-Safe Transfer:** Copies only new or modified files at a cool, throttled 120 MB/s to protect the SSD controller from thermal throttling.
-3. **Automatic Cryptographic Verification:** Immediately runs uncached **SHA-256 cryptographic hash checks** on all newly transferred files, reading them back directly from physical disk to guarantee zero bit-rot or packet drops.
-4. **Fast Runtime:** Routine incremental backups finish in minutes instead of requiring a prolonged full-drive rewrite.
+1. **Incremental Selection:** Rsync compares file size and modification time to select files to copy. Scan time depends on the filesystem and number of files.
+2. **Rate-limited Transfer:** By default, rsync is limited to 120 MB/s (subject to the installed rsync implementation).
+3. **Content Check:** Newly transferred files are SHA-256 compared with their source files after copying.
+4. **Incremental Copy:** Unchanged files selected by rsync are skipped.
 
 ---
 
@@ -71,35 +66,33 @@ USAGE:
 
 OPTIONS:
   (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
-                       of all newly transferred files. Perfect for routine backups!
-  -a, --full-audit     Full Audit / Scrub Mode. Cryptographic audit (Source Baseline -> Destination
-                       Physical Scrub with 5 GB thermal firebreaks -> Bit-for-bit verification & auto-repair).
+                       of newly transferred files; skipped files are not checksummed.
+  -a, --full-audit     Hash source and destination files, then repair content mismatches.
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
-  -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
+  -n, -d, --dry-run    Simulation mode. Does not modify the destination; writes a local report.
   -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
   -p, --prune          Prune / Mirror mode. Deletes files from destination that no longer exist in
                        source (gated behind confirmation to protect against accidental loss).
   -v, --verbose        Verbose mode. Streams per-file logs and displays full transfer report in terminal.
-  -b, --bw <LIMIT>     Bandwidth rate limit (e.g. 120M, 250M, 50M). Default is 120M (thermal-safe).
-  -m, --max, --full    Uncapped full throttle (no bandwidth limit). Recommended for transfers < 20 GB.
+  -b, --bw <LIMIT>     Rsync bandwidth limit (e.g. 120M, 250M, 50M). Default is 120M.
+  -m, --max, --full    Remove the rsync bandwidth limit.
   -h, --help           Show help message.
   -V, --version        Show version number.
 ```
 
 ### Examples
 
-#### 1. Routine Smart Backup (Default — Fast & Cryptographically Verified)
+#### 1. Routine Smart Backup
 ```bash
 safesync "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
-#### 2. Annual Full Scrub (Audits 100% of Historical Files)
-Use this periodically or before wiping/reformatting a Mac:
+#### 2. Full Content Audit and Repair
 ```bash
 safesync -a "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
 
-#### 3. Dry-Run Simulation (Test without Modifying Files)
+#### 3. Dry-Run Simulation (Does Not Modify the Destination)
 ```bash
 safesync -d "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 ```
@@ -134,13 +127,13 @@ During execution, `safesync` displays an in-place, unbuffered progress bar drive
 # 1. Live Transfer Progress:
  [✓] [01:15] ⚡ [SmartSync] [====================] 100.0% (27,297/27,297) [🟢 40 | 🟡 2] | Transfer complete [6.3 GB]
 
-# 2. Direct Physical NAND Verification:
- [✓] [01:45] 🔒 [Verifying Physical NAND] [====================] 100.0% (42/42) | Verified bit-for-bit
+# 2. SHA-256 Content Comparison:
+ [✓] [01:45] 🔒 [Comparing file contents] [====================] 100.0% (42/42) | Hashes match
 
 # 3. High-Visibility Final Outcome Banner (Green for Success, Yellow for Simulation, Red for Issues):
 ══════════════════════════════════════════════════════════════
  [✓] ✨ SMART SYNC SUCCESS (01m 45s):
-     - 📦 42 files (6.3 GB) transferred & 100% verified bit-for-bit (40 new, 2 modified)!
+     - 📦 42 files (6.3 GB) transferred and checksum compared (40 new, 2 modified).
      - ⚡ Historical files skipped instantly in seconds.
      📄 Detailed report: file:///Users/<username>/Library/Logs/safesync/safesync_report.txt
      💡 Quick view:      open ~/Library/Logs/safesync/safesync_report.txt
@@ -154,7 +147,7 @@ During execution, `safesync` displays an in-place, unbuffered progress bar drive
 * **`[====================]`:** High-contrast 20-character visual progress bar.
 * **`[🟢 40 | 🟡 2]`:** Categorized breakdown of **🟢 New** and **🟡 Modified** files.
 * **`[6.3 GB]`:** Real-time human-readable volume of data transferred (in B, KB, MB, GB, or TB).
-* **`Verified bit-for-bit`:** Confirmation of direct NAND hash verification bypassing macOS RAM cache.
+* **Checksum match:** Source and destination file contents returned the same SHA-256 digest during comparison.
 * **Theme-Adaptive Dimming:** Metadata headers utilize ANSI SGR 2 (`\033[2m`) to subtly dim configuration details across dark, light, and solarized palettes.
 * **Yellow Attention Gates:** Prompts awaiting user approval (such as creating a new destination folder) are framed in bold yellow border boxes.
 
@@ -176,13 +169,13 @@ If `rsync` ever exits with an error status code, use this reference table:
 
 | Exit Code | Meaning | Cause & Recommended Action |
 | :---: | :--- | :--- |
-| **0** | **Success** | All files verified bit-for-bit identical. |
+| **0** | **Success** | The selected operation completed without a reported error. |
 | **1** | **Syntax / Usage Error** | Missing path or unrecognized flag. Check `safesync --help`. |
 | **11** | **File I/O Error** | Disk is full, file system error, or hardware failure. Check free disk space. |
 | **12** | **Protocol Stream Error** | Cable was unseated or drive controller disconnected during transfer. |
 | **20** | **Interrupted** | The user pressed `Ctrl + C` or process was terminated. Safe to re-run. |
-| **23** | **Partial Transfer** | A temporary file vanished before copying. *(Safe to ignore if media matches)*. |
-| **24** | **Vanished Source File** | A temporary file was deleted while `rsync` was reading. Handled automatically by `safesync`. |
+| **23** | **Partial Transfer** | A transfer did not complete. Review the rsync error and rerun after resolving it. |
+| **24** | **Vanished Source File** | A source file changed or disappeared during transfer. SafeSync treats this run as incomplete. |
 | **30** | **Timeout** | Communication timed out (e.g. drive went to sleep or USB hub crashed). |
 
 ---

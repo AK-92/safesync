@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SafeSync — Hardened, Verified Media Backup for macOS
-# Zero Silent Corruption over USB-C & External SSDs
+# SafeSync — Folder sync with optional SHA-256 verification for macOS
 # ==============================================================================
 
 set -o pipefail
 
 # NOTE (SEC-14): Do NOT add 'set -e' — PIPESTATUS capture and custom error reporting
 # require pipelines and pre-flight tests to complete without early shell abort.
-VERSION="0.5.10"
+VERSION="0.6.0"
 
 show_help() {
   cat << EOF
@@ -16,35 +15,32 @@ SafeSync (v${VERSION}) — Verified Media Backup for macOS
 
 DEFAULT BEHAVIOR:
   Smart Incremental Mode is the DEFAULT.
-  - Existing, identical files are scanned by size + timestamp in seconds.
-  - Only new or modified files are transferred at a safe, cool 120 MB/s.
-  - All newly transferred files are immediately verified bit-for-bit with uncached
-    SHA-256 cryptographic hashes read back from physical disk.
+  - Rsync selects files using its normal size and modification-time checks.
+  - Newly transferred files are compared with SHA-256 checksums after copying.
 
 USAGE:
   safesync [OPTIONS] <SOURCE_FOLDER> <DESTINATION_FOLDER>
 
 OPTIONS:
   (default)            Smart Incremental Mode. Fast size/time scan + full SHA-256 hash verification
-                       of all newly transferred files. Perfect for routine backups!
-  -a, --full-audit     Full Audit / Scrub Mode. Cryptographic audit (Source Baseline -> Destination
-                       Physical Scrub with 5 GB thermal firebreaks -> Bit-for-bit verification & auto-repair).
+                       of newly transferred files; skipped files are not checksummed.
+  -a, --full-audit     Hash source and destination files, then repair content mismatches.
   -q, --quick          Quick-scan mode. Size + timestamp comparison only (skips post-transfer hashing).
-  -n, -d, --dry-run    Simulation mode. Simulates the sync without writing any files to disk.
+  -n, -d, --dry-run    Simulation mode. Does not modify the destination; writes a local report.
   -i, --confirm        Interactive mode. Scans first and prompts [Y/n] before transferring files.
   -p, --prune          Prune / Mirror mode. Deletes files from destination that no longer exist in
                        source (gated behind confirmation to protect against accidental loss).
   -v, --verbose        Verbose mode. Streams per-file logs and displays full transfer report in terminal.
-  -b, --bw <LIMIT>     Bandwidth rate limit (e.g. 120M, 250M, 50M). Default is 120M (thermal-safe).
-  -m, --max, --full    Uncapped full throttle (no bandwidth limit). Recommended for transfers < 20 GB.
+  -b, --bw <LIMIT>     Rsync bandwidth limit (e.g. 120M, 250M, 50M). Default is 120M.
+  -m, --max, --full    Remove the rsync bandwidth limit.
   -h, --help           Show this help message and exit.
   -V, --version        Show version number.
 
 EXAMPLES:
-  # Routine Smart Backup (Default: fast scan + cryptographic verification of new files):
+  # Routine Smart Backup (Default: checksum compare newly copied files):
   safesync "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 
-  # Annual Full Scrub (cryptographic audit across physical media with thermal firebreaks):
+  # Full content audit and repair:
   safesync -a "/Users/<username>/Pictures/Photos Library.photoslibrary" "/Volumes/BackupSSD/Photos Library.photoslibrary"
 
   # Quick simulation test (modifies nothing, previews changes):
@@ -339,7 +335,7 @@ if [[ $INTERACTIVE -eq 1 && $DRY_RUN -eq 0 ]]; then
   PREFLIGHT_RAW=$(rsync "${CLEAN_PREFLIGHT_FLAGS[@]}" -n "$SRC" "$DST" 2>"$PREFLIGHT_ERR_FILE")
   PREFLIGHT_STATUS=$?
 
-  if [[ $PREFLIGHT_STATUS -ne 0 && $PREFLIGHT_STATUS -ne 24 ]]; then
+  if [[ $PREFLIGHT_STATUS -ne 0 ]]; then
     echo "==============================================================" >&2
     echo "  [!] ERROR: Pre-flight scan failed (rsync exit code $PREFLIGHT_STATUS)." >&2
     if [[ -f "$PREFLIGHT_ERR_FILE" ]]; then
@@ -399,18 +395,18 @@ echo -e "${C_DIM}==============================================================$
 if [[ $DRY_RUN -eq 1 ]]; then
   echo -e "  🔍 ${C_BOLD}Starting SafeSync v${VERSION} [DRY-RUN / SIMULATION MODE]${C_RESET}"
 elif [[ "$MODE" == "full_audit" ]]; then
-  echo -e "  🛡️  ${C_BOLD}Starting SafeSync v${VERSION} [FULL AUDIT / 100% CHECKSUM SCRUB]${C_RESET}"
+  echo -e "  🛡️  ${C_BOLD}Starting SafeSync v${VERSION} [FULL CONTENT AUDIT]${C_RESET}"
 elif [[ "$MODE" == "quick" ]]; then
   echo -e "  ⚡ ${C_BOLD}Starting SafeSync v${VERSION} [QUICK-SCAN MODE (Size + Timestamp)]${C_RESET}"
 else
-  echo -e "  🛡️  ${C_BOLD}Starting SafeSync v${VERSION} [SMART INCREMENTAL (Bit-for-Bit Verified)]${C_RESET}"
+  echo -e "  🛡️  ${C_BOLD}Starting SafeSync v${VERSION} [SMART INCREMENTAL]${C_RESET}"
 fi
 echo -e "${C_DIM}  📁 Source:       $SRC${C_RESET}"
 echo -e "${C_DIM}  💾 Destination:  $DST${C_RESET}"
 if [[ "$BW_LIMIT" == "0" || "$BW_LIMIT" == "max" ]]; then
   echo -e "${C_DIM}  🚀 Bandwidth:    Full Throttle (Uncapped)${C_RESET}"
 else
-  echo -e "${C_DIM}  ❄️  Bandwidth:    Throttled to ${BW_LIMIT} (Thermal & Packet-Drop Safe)${C_RESET}"
+  echo -e "${C_DIM}  📶 Bandwidth:    Limited to ${BW_LIMIT}${C_RESET}"
 fi
 if [[ $PRUNE -eq 1 ]]; then
   echo -e "${C_DIM}  ✂️  Prune Mode:   Enabled (Orphan cleanup active)${C_RESET}"
@@ -498,8 +494,8 @@ else
   RSYNC_STATUS=${PIPE_STATUSES[0]}
   PYTHON_STATUS=${PIPE_STATUSES[1]}
 
-  # Propagate rsync errors (exit code 24 = vanished source files, often harmless temporary lock files)
-  if [[ $RSYNC_STATUS -ne 0 && $RSYNC_STATUS -ne 24 ]]; then
+  # Any rsync error, including vanished source files, makes this run incomplete.
+  if [[ $RSYNC_STATUS -ne 0 ]]; then
     echo " [!] WARNING: rsync exited with status code $RSYNC_STATUS" >&2
     exit $RSYNC_STATUS
   fi
